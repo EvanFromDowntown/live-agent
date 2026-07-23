@@ -104,6 +104,8 @@ environment:
     start_url: https://quotes.toscrape.com
     success_file: results.json
     success_min: 10
+    success_fields: [text, author]   # each record must carry real quote text AND author
+    min_field_chars: 1
     max_steps: 6
     budget: 8
     # ---- sandbox ----

@@ -205,8 +205,12 @@ func (e *Env) listFiles() []string {
 	return out
 }
 
-// recordCount returns how many records the success file contains: a JSON array's
-// length, else the number of non-empty lines.
+// recordCount returns how many SUBSTANTIVE records the success file contains.
+// A record only counts if it carries real extracted content — this closes the
+// loophole where the agent "succeeds" by writing empty/placeholder records
+// (e.g. {"content":""} or {"content":"NO_ANSWERS_FOUND"}). For a JSON array,
+// each element must satisfy substantive(); for a text file, each line must be a
+// substantive value.
 func (e *Env) recordCount() int {
 	full, err := e.safePath(e.successFile)
 	if err != nil {
@@ -218,13 +222,78 @@ func (e *Env) recordCount() int {
 	}
 	var arr []any
 	if json.Unmarshal(b, &arr) == nil {
-		return len(arr)
+		n := 0
+		for _, rec := range arr {
+			if e.substantive(rec) {
+				n++
+			}
+		}
+		return n
 	}
 	n := 0
 	for _, line := range strings.Split(string(b), "\n") {
-		if strings.TrimSpace(line) != "" {
+		if e.substantiveText(line) {
 			n++
 		}
 	}
 	return n
+}
+
+// placeholderTokens are obvious "no real data" markers the agent should not be
+// able to pass off as extracted content.
+var placeholderTokens = []string{"no_answers_found", "no answers found", "not found", "n/a", "none", "null", "placeholder", "todo", "unknown", "no data", "no_data"}
+
+func isPlaceholder(s string) bool {
+	l := strings.ToLower(strings.TrimSpace(s))
+	if l == "" {
+		return true
+	}
+	for _, t := range placeholderTokens {
+		if l == t {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Env) substantiveText(s string) bool {
+	s = strings.TrimSpace(s)
+	if isPlaceholder(s) {
+		return false
+	}
+	return len([]rune(s)) >= e.minFieldChars
+}
+
+// substantive decides whether one record carries real content. For JSON objects
+// with SuccessFields configured, every listed field must be a non-placeholder
+// string of at least minFieldChars. Without SuccessFields, at least one string
+// value must qualify. Non-object records fall back to a length/placeholder check.
+func (e *Env) substantive(rec any) bool {
+	m, ok := rec.(map[string]any)
+	if !ok {
+		return e.substantiveText(fmt.Sprintf("%v", rec))
+	}
+	fieldOK := func(v any) bool {
+		s, ok := v.(string)
+		if !ok {
+			// Non-empty non-string values (e.g. a nested list of answers) count.
+			return v != nil
+		}
+		s = strings.TrimSpace(s)
+		return !isPlaceholder(s) && len([]rune(s)) >= e.minFieldChars
+	}
+	if len(e.successFields) > 0 {
+		for _, f := range e.successFields {
+			if !fieldOK(m[f]) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, v := range m {
+		if fieldOK(v) {
+			return true
+		}
+	}
+	return false
 }

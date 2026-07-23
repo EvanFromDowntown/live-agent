@@ -89,15 +89,19 @@ environment:
   params:
     task: >-
       Crawl this Zhihu question page: https://www.zhihu.com/question/747969552 .
-      Fetch the page, extract the question title and as many answers as possible
-      (author + answer text), and save them as a JSON array of objects to
-      result.json in the current working directory. Note: Zhihu aggressively
+      Fetch the page, extract as many answers as possible and save them as a JSON
+      array of objects, each {"author": <name>, "content": <full answer text>},
+      to result.json in the current working directory. Note: Zhihu aggressively
       blocks anonymous requests (HTTP 403 + a JS "zh-zse-ck" challenge), so a
       plain fetch may return no content — adapt using browser-like headers and a
-      cookie jar. Succeeds when result.json contains at least 1 record.
+      cookie jar. Succeeds ONLY when result.json holds real answers: each record
+      needs a non-empty "content" of at least 20 characters (placeholder or empty
+      content does NOT count).
     start_url: https://www.zhihu.com/question/747969552
     success_file: result.json
     success_min: 1
+    success_fields: [content]
+    min_field_chars: 20
     max_steps: 8
     budget: 8
     image: python:3.12-slim

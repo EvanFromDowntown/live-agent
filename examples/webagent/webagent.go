@@ -21,12 +21,14 @@ type Env struct {
 	mu  sync.Mutex
 	box *sandbox.Docker
 
-	task        string
-	startURL    string
-	successFile string
-	successMin  int
-	maxSteps    int64
-	budgetInit  float64
+	task          string
+	startURL      string
+	successFile   string
+	successMin    int
+	successFields []string
+	minFieldChars int
+	maxSteps      int64
+	budgetInit    float64
 
 	tick         int64
 	step         int64
@@ -46,8 +48,15 @@ type Params struct {
 	StartURL    string
 	SuccessFile string
 	SuccessMin  int
-	MaxSteps    int64
-	Budget      float64
+	// SuccessFields, when set, are field names that must ALL be present and
+	// non-empty for a JSON-object record to count. MinFieldChars is the minimum
+	// trimmed length such a field must have. Together they stop the agent from
+	// "succeeding" by writing placeholder/empty records (e.g. content:"" or
+	// "NO_ANSWERS_FOUND").
+	SuccessFields []string
+	MinFieldChars int
+	MaxSteps      int64
+	Budget        float64
 }
 
 // New builds the environment with a Docker sandbox.
@@ -66,7 +75,8 @@ func New(box *sandbox.Docker, p Params) *Env {
 	}
 	return &Env{
 		box: box, task: p.Task, startURL: p.StartURL, successFile: p.SuccessFile,
-		successMin: p.SuccessMin, maxSteps: p.MaxSteps, budgetInit: p.Budget, budget: p.Budget,
+		successMin: p.SuccessMin, successFields: p.SuccessFields, minFieldChars: p.MinFieldChars,
+		maxSteps: p.MaxSteps, budgetInit: p.Budget, budget: p.Budget,
 	}
 }
 

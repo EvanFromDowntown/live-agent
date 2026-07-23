@@ -171,12 +171,14 @@ func buildEnvironment(cfg *config.Config) (domain.Environment, error) {
 			return nil, err
 		}
 		return webagent.New(box, webagent.Params{
-			Task:        pStr(cfg, "task"),
-			StartURL:    pStr(cfg, "start_url"),
-			SuccessFile: pStr(cfg, "success_file"),
-			SuccessMin:  pInt(cfg, "success_min"),
-			MaxSteps:    int64(pInt(cfg, "max_steps")),
-			Budget:      pFloat(cfg, "budget"),
+			Task:          pStr(cfg, "task"),
+			StartURL:      pStr(cfg, "start_url"),
+			SuccessFile:   pStr(cfg, "success_file"),
+			SuccessMin:    pInt(cfg, "success_min"),
+			SuccessFields: pStrSlice(cfg, "success_fields"),
+			MinFieldChars: pInt(cfg, "min_field_chars"),
+			MaxSteps:      int64(pInt(cfg, "max_steps")),
+			Budget:        pFloat(cfg, "budget"),
 		}), nil
 	case "gridworld", "":
 		return gridworld.New(gridworld.Params{
@@ -219,6 +221,20 @@ func pInt(cfg *config.Config, key string) int {
 func pStr(cfg *config.Config, key string) string {
 	s, _ := cfg.Environment.Params[key].(string)
 	return s
+}
+
+func pStrSlice(cfg *config.Config, key string) []string {
+	raw, ok := cfg.Environment.Params[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func pFloat(cfg *config.Config, key string) float64 {

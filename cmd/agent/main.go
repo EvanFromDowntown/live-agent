@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"liveagent/examples/gridworld"
+	"liveagent/examples/webagent"
 	"liveagent/internal/cognition"
 	"liveagent/internal/config"
 	"liveagent/internal/domain"
@@ -25,6 +26,7 @@ import (
 	"liveagent/internal/memory"
 	"liveagent/internal/reflection"
 	"liveagent/internal/safety"
+	"liveagent/internal/sandbox"
 	"liveagent/internal/skills"
 )
 
@@ -103,12 +105,13 @@ func run(cfgPath string, step bool, maxTicks int64) error {
 	expander := skills.NewExpander(registry)
 	evaluator := evaluation.New(cfg.Evolution, registry)
 	evo := evolution.New(store, evaluator, cfg.Evolution)
-	reflector := reflection.New(model)
+	reflector := reflection.New(model, cfg.LLM.MaxTokens)
 
 	// Cognition (the Agent).
 	agent := cognition.New(cognition.Deps{
 		State: state, LLM: model, Memory: store, Registry: registry,
 		Guard: guard, Expander: expander, Goals: cfg.Goals,
+		Temperature: cfg.LLM.Temperature, MaxTokens: cfg.LLM.MaxTokens,
 	})
 
 	rt := kernel.New(kernel.Deps{
@@ -155,6 +158,26 @@ func loadOrCreateState(ctx context.Context, store *memory.Store, cfg *config.Con
 // environment types are allowed.
 func buildEnvironment(cfg *config.Config) (domain.Environment, error) {
 	switch cfg.Environment.Type {
+	case "webagent":
+		box, err := sandbox.NewDocker(sandbox.Config{
+			Image:          pStr(cfg, "image"),
+			WorkDirHost:    pStr(cfg, "workspace"),
+			Network:        pStr(cfg, "network"),
+			MemoryMB:       pInt(cfg, "memory_mb"),
+			CPUs:           pFloat(cfg, "cpus"),
+			DefaultTimeout: pInt(cfg, "timeout_sec"),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return webagent.New(box, webagent.Params{
+			Task:        pStr(cfg, "task"),
+			StartURL:    pStr(cfg, "start_url"),
+			SuccessFile: pStr(cfg, "success_file"),
+			SuccessMin:  pInt(cfg, "success_min"),
+			MaxSteps:    int64(pInt(cfg, "max_steps")),
+			Budget:      pFloat(cfg, "budget"),
+		}), nil
 	case "gridworld", "":
 		return gridworld.New(gridworld.Params{
 			Width:         pInt(cfg, "width"),
@@ -191,6 +214,11 @@ func pInt(cfg *config.Config, key string) int {
 	default:
 		return 0
 	}
+}
+
+func pStr(cfg *config.Config, key string) string {
+	s, _ := cfg.Environment.Params[key].(string)
+	return s
 }
 
 func pFloat(cfg *config.Config, key string) float64 {

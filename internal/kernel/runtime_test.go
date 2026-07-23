@@ -87,7 +87,7 @@ func buildRuntime(t *testing.T, cfg *config.Config, store *memory.Store) (*kerne
 	})
 	rt := kernel.New(kernel.Deps{
 		Config: cfg, Store: store, Env: env, Body: body, Agent: agent, State: state,
-		Guard: guard, Reflector: reflection.New(model), Evolution: evo, Logger: logger,
+		Guard: guard, Reflector: reflection.New(model, 512), Evolution: evo, Logger: logger,
 	})
 	return rt, state
 }

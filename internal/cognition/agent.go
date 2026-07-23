@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"liveagent/internal/config"
 	"liveagent/internal/domain"
@@ -26,6 +27,9 @@ type Agent struct {
 	guard    *safety.Guard
 	expander *skills.Expander
 	goals    []domain.Goal
+
+	temperature float64
+	maxTokens   int
 
 	// lastRetrieved caches memory retrieved during SelectGoal for reuse in Plan.
 	lastRetrieved []domain.MemoryItem
@@ -47,6 +51,12 @@ type Deps struct {
 	Guard    *safety.Guard
 	Expander *skills.Expander
 	Goals    []config.GoalConfig
+
+	// Temperature and MaxTokens are taken from the LLM config so the token budget
+	// is large enough for reasoning models (which spend tokens on hidden
+	// reasoning before emitting content).
+	Temperature float64
+	MaxTokens   int
 }
 
 // New builds an Agent.
@@ -57,9 +67,14 @@ func New(d Deps) *Agent {
 			ID: g.ID, Description: g.Description, Priority: g.Priority, Tags: g.Tags, Root: true,
 		})
 	}
+	maxTokens := d.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
 	return &Agent{
 		state: d.State, llm: d.LLM, mem: d.Memory, registry: d.Registry,
 		guard: d.Guard, expander: d.Expander, goals: goals,
+		temperature: d.Temperature, maxTokens: maxTokens,
 	}
 }
 
@@ -91,14 +106,16 @@ func (a *Agent) SelectGoal(ctx context.Context) (domain.Goal, error) {
 		"task":       "goal",
 		"age":        a.state.Age,
 		"body":       a.state.BodyState,
+		"world":      a.compactWorld(),
 		"goals":      goalOpts,
 		"principles": a.principleTexts(),
 	}
 	req := domain.LLMRequest{
-		System:    "You select the agent's next goal from the allowed list. Reply STRICT JSON {\"goal_id\":string,\"reason\":string}.",
-		User:      llm.BuildUserMessage("Choose the most appropriate goal id.", ctxMap),
-		JSONMode:  true,
-		MaxTokens: 200,
+		System:      "You select the agent's next goal from the allowed list. Reply STRICT JSON {\"goal_id\":string,\"reason\":string}.",
+		User:        llm.BuildUserMessage("Choose the most appropriate goal id.", ctxMap),
+		JSONMode:    true,
+		Temperature: a.temperature,
+		MaxTokens:   a.maxTokens,
 	}
 	a.state.ResourceUsage.LLMCalls++
 
@@ -147,21 +164,28 @@ func (a *Agent) Plan(ctx context.Context, goal domain.Goal) (domain.Plan, error)
 		"available_actions": toAnySlice(avail),
 		"principles":        a.principleTexts(),
 		"body":              a.state.BodyState,
+		"world":             a.compactWorld(), // last stdout/stderr (truncated) for iteration
 	}
 	req := domain.LLMRequest{
 		System: "You output a concrete action plan of 3 to 5 ordered steps that make real progress toward the goal. " +
 			"Reply STRICT JSON {\"steps\":[{\"action\":string,\"parameters\":object}],\"rationale\":string}. " +
 			"Only use actions from available_actions. Do NOT repeat the same passive action every step; advance the agent.",
-		User:      llm.BuildUserMessage("Produce a 3-5 step plan.", ctxMap),
-		JSONMode:  true,
-		MaxTokens: 500,
+		User:        llm.BuildUserMessage("Produce a 3-5 step plan.", ctxMap),
+		JSONMode:    true,
+		Temperature: a.temperature,
+		MaxTokens:   a.maxTokens,
 	}
 	a.state.ResourceUsage.LLMCalls++
 
 	var plan domain.Plan
 	plan.GoalID = goal.ID
 	if resp, err := a.llm.Generate(ctx, req); err == nil {
+		if os.Getenv("LA_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[LA_DEBUG plan raw] %s\n", truncateDbg(resp.Text, 800))
+		}
 		plan.Steps, plan.Rationale = a.parsePlanSteps(resp.Text)
+	} else if os.Getenv("LA_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[LA_DEBUG plan error] %v\n", err)
 	}
 	// 3. Validate & drop anything not registered; fall back if empty.
 	plan.Steps = a.validateSteps(plan.Steps)
@@ -228,7 +252,22 @@ func (a *Agent) Learn(ctx context.Context, exp domain.Experience) error {
 	a.state.SelfModel.Capabilities[name] = cap + 0.2*(target-cap) // EMA toward outcome
 	a.state.SelfModel.RiskEstimates[name] = 0.8*a.state.SelfModel.RiskEstimates[name] + 0.2*exp.Reward.RiskCost
 	a.state.ResourceUsage.Actions++
+
+	// If the last step went wrong (a risk cost was incurred, e.g. a script errored
+	// or an action failed), abandon the rest of the cached plan so the agent
+	// replans next tick with the fresh error output in view instead of blindly
+	// executing stale steps.
+	if exp.Reward.RiskCost > 0 {
+		a.curPlan = nil
+	}
 	return nil
+}
+
+func truncateDbg(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...[truncated]"
 }
 
 // State returns the shared state pointer (used by the kernel).

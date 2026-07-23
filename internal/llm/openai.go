@@ -18,16 +18,18 @@ import (
 // Credentials are read from environment variables ONLY — never from config or
 // source — so no secret is ever committed.
 type OpenAIProvider struct {
-	baseURL string
-	apiKey  string
-	model   string
-	client  *http.Client
+	baseURL               string
+	apiKey                string
+	model                 string
+	client                *http.Client
+	disableResponseFormat bool
 }
 
 // OpenAIConfig configures the provider. Model may be overridden by LLM_MODEL.
 type OpenAIConfig struct {
-	Model   string
-	Timeout time.Duration
+	Model                 string
+	Timeout               time.Duration
+	DisableResponseFormat bool
 }
 
 // NewOpenAIProvider builds a provider from env vars LLM_BASE_URL, LLM_API_KEY,
@@ -53,10 +55,11 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		timeout = 30 * time.Second
 	}
 	return &OpenAIProvider{
-		baseURL: base,
-		apiKey:  key,
-		model:   model,
-		client:  &http.Client{Timeout: timeout},
+		baseURL:               base,
+		apiKey:                key,
+		model:                 model,
+		client:                &http.Client{Timeout: timeout},
+		disableResponseFormat: cfg.DisableResponseFormat,
 	}, nil
 }
 
@@ -97,7 +100,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 	}
-	if req.JSONMode {
+	if req.JSONMode && !p.disableResponseFormat {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	raw, err := json.Marshal(body)

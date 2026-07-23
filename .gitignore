@@ -13,6 +13,10 @@
 /bin/
 *.log
 
+# Sandbox scratch workspace (agent-generated code/output; default lives under
+# $HOME/.liveagent, but ignore any stray copy created in the repo)
+/sandbox_workspace/
+
 # OS / editor
 .DS_Store
 .idea/

@@ -78,30 +78,76 @@ func (a *Agent) planFromSkill(goal domain.Goal) (domain.Plan, bool) {
 	return domain.Plan{}, false
 }
 
+// parsePlanSteps leniently extracts an action plan from LLM output. Real models
+// vary a lot in shape, so we tolerate: steps under "steps"/"plan"/"actions", the
+// action name under "action"/"name"/"tool", and parameters under
+// "parameters"/"params"/"arguments"/"input" — or, failing that, any leftover
+// keys on the step object are treated as the parameters.
 func (a *Agent) parsePlanSteps(text string) ([]domain.Action, string) {
 	obj, err := llm.ExtractJSONObject(text)
 	if err != nil {
 		return nil, ""
 	}
-	var parsed struct {
-		Steps []struct {
-			Action     string         `json:"action"`
-			Parameters map[string]any `json:"parameters"`
-		} `json:"steps"`
-		Rationale string `json:"rationale"`
-	}
-	if json.Unmarshal([]byte(obj), &parsed) != nil {
+	var root map[string]any
+	if json.Unmarshal([]byte(obj), &root) != nil {
 		return nil, ""
 	}
-	steps := make([]domain.Action, 0, len(parsed.Steps))
-	for _, s := range parsed.Steps {
-		params := s.Parameters
-		if params == nil {
-			params = map[string]any{}
+	rationale, _ := root["rationale"].(string)
+
+	var rawSteps []any
+	for _, key := range []string{"steps", "plan", "actions"} {
+		if v, ok := root[key].([]any); ok {
+			rawSteps = v
+			break
 		}
-		steps = append(steps, domain.Action{Name: s.Action, Parameters: params})
 	}
-	return steps, parsed.Rationale
+	// Some models return a single action object instead of a list.
+	if rawSteps == nil {
+		if _, ok := firstKey(root, "action", "name", "tool"); ok {
+			rawSteps = []any{root}
+		}
+	}
+
+	steps := make([]domain.Action, 0, len(rawSteps))
+	for _, rs := range rawSteps {
+		m, ok := rs.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, ok := firstKey(m, "action", "name", "tool")
+		if !ok || name == "" {
+			continue
+		}
+		params := extractParams(m)
+		steps = append(steps, domain.Action{Name: name, Parameters: params})
+	}
+	return steps, rationale
+}
+
+func firstKey(m map[string]any, keys ...string) (string, bool) {
+	for _, k := range keys {
+		if s, ok := m[k].(string); ok {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+func extractParams(step map[string]any) map[string]any {
+	for _, k := range []string{"parameters", "params", "arguments", "args", "input"} {
+		if p, ok := step[k].(map[string]any); ok {
+			return p
+		}
+	}
+	// Fall back to leftover keys (everything except recognised control fields).
+	control := map[string]bool{"action": true, "name": true, "tool": true, "rationale": true, "reason": true, "thought": true}
+	params := map[string]any{}
+	for k, v := range step {
+		if !control[k] {
+			params[k] = v
+		}
+	}
+	return params
 }
 
 // validateSteps keeps only steps that pass registry validation (whitelist +
@@ -139,18 +185,38 @@ func (a *Agent) fallbackGoal() domain.Goal {
 	return best
 }
 
-// fallbackSteps returns a single safe action (prefer observe, else any registered).
+// fallbackSteps returns a single safe action. It prefers a passive, non-terminal
+// action (observe/read_file) and NEVER falls back to a terminal action like
+// "finish", which would end an episode without doing any work.
 func (a *Agent) fallbackSteps() []domain.Action {
 	names := a.registry.Names()
+	prefer := []string{"observe", "read_file", "rest"}
+	for _, p := range prefer {
+		for _, n := range names {
+			if n == p {
+				return []domain.Action{{Name: n, Parameters: map[string]any{}}}
+			}
+		}
+	}
+	// Otherwise the first non-terminal registered action with no required params.
 	for _, n := range names {
-		if n == "observe" {
+		if n == "finish" || n == "done" || n == "stop" {
+			continue
+		}
+		if sc, ok := a.registry.Schema(n); ok && !hasRequired(sc) {
 			return []domain.Action{{Name: n, Parameters: map[string]any{}}}
 		}
 	}
-	if len(names) > 0 {
-		return []domain.Action{{Name: names[0], Parameters: map[string]any{}}}
-	}
 	return nil
+}
+
+func hasRequired(s domain.ActionSchema) bool {
+	for _, p := range s.Parameters {
+		if p.Required {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) goalByID(id string) (domain.Goal, bool) {
@@ -184,6 +250,40 @@ func tagsOverlap(a, b []string) bool {
 		}
 	}
 	return false
+}
+
+// compactAny shrinks a value for prompting: long strings are truncated and long
+// slices are capped, so a huge WorldState (e.g. large last_stdout) cannot blow
+// up the prompt and starve a reasoning model's token budget.
+func compactAny(v any, maxStr, maxLen int) any {
+	switch x := v.(type) {
+	case string:
+		if len(x) > maxStr {
+			return x[:maxStr] + "…[truncated]"
+		}
+		return x
+	case map[string]any:
+		m := make(map[string]any, len(x))
+		for k, vv := range x {
+			m[k] = compactAny(vv, maxStr, maxLen)
+		}
+		return m
+	case []any:
+		if len(x) > maxLen {
+			x = x[:maxLen]
+		}
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = compactAny(e, maxStr, maxLen)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func (a *Agent) compactWorld() any {
+	return compactAny(a.state.WorldState, 600, 40)
 }
 
 func toAnySlice(ss []string) []any {

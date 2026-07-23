@@ -41,18 +41,25 @@ Do not include any prose outside the JSON.`
 
 // Reflector produces reflections via the LLM.
 type Reflector struct {
-	llm domain.LLM
+	llm       domain.LLM
+	maxTokens int
 }
 
-// New builds a Reflector.
-func New(model domain.LLM) *Reflector { return &Reflector{llm: model} }
+// New builds a Reflector. maxTokens should be generous for reasoning models
+// (hidden reasoning consumes the completion budget before content is emitted).
+func New(model domain.LLM, maxTokens int) *Reflector {
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+	return &Reflector{llm: model, maxTokens: maxTokens}
+}
 
 // Reflect analyses an episode. On a parse failure it retries once; if it still
 // cannot parse valid JSON it returns a Reflection with Parsed=false and the raw
 // text preserved (the caller must NOT update principles in that case).
 func (r *Reflector) Reflect(ctx context.Context, ep domain.Episode, body map[string]any) (Reflection, error) {
 	user := llm.BuildUserMessage("Reflect on this episode and output the reflection JSON.", r.buildContext(ep, body))
-	req := domain.LLMRequest{System: systemPrompt, User: user, Temperature: 0.2, MaxTokens: 512, JSONMode: true}
+	req := domain.LLMRequest{System: systemPrompt, User: user, Temperature: 0.2, MaxTokens: r.maxTokens, JSONMode: true}
 
 	var lastRaw string
 	for attempt := 0; attempt < 2; attempt++ {

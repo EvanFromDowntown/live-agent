@@ -49,6 +49,11 @@ type LLMConfig struct {
 	MaxTokens   int           `yaml:"max_tokens"`
 	Timeout     time.Duration `yaml:"timeout"`
 	MaxRetries  int           `yaml:"max_retries"`
+	// DisableResponseFormat turns off the OpenAI `response_format: json_object`
+	// hint. Some gateways corrupt content in JSON mode (e.g. silently stripping
+	// the substring "json" from string values, which breaks generated code). When
+	// disabled, the model is asked for JSON in the prompt and parsed leniently.
+	DisableResponseFormat bool `yaml:"disable_response_format"`
 }
 
 // RewardConfig holds the weights used to scalarise a RewardVector. Weights are

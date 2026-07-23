@@ -147,6 +147,11 @@ func (r *Runtime) Step(parent context.Context) error {
 	if err != nil {
 		return err
 	}
+	planNames := make([]string, 0, len(plan.Steps))
+	for _, s := range plan.Steps {
+		planNames = append(planNames, s.Name)
+	}
+	r.d.Logger.Info("plan", "goal", goal.ID, "steps", planNames, "rationale", plan.Rationale)
 	action, err := r.d.Agent.SelectAction(ctx, plan)
 	if err != nil {
 		return err
@@ -209,6 +214,7 @@ func (r *Runtime) Step(parent context.Context) error {
 		"health", body(st, "health"),
 		"episode", r.episode.ID,
 		"skill", plan.SkillName,
+		"outcome", outcome.Text,
 	)
 
 	// 10. Episode boundary -> reflect & evolve.

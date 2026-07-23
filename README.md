@@ -99,8 +99,44 @@ export LLM_MODEL="gpt-4o-mini"
 go run ./cmd/agent -config configs/gridworld.yaml
 ```
 
-Provider 使用标准 `/chat/completions`，对目标/计划/反思启用 `response_format: json_object`，
+Provider 使用标准 `/chat/completions`，对目标/计划/反思请求 JSON 结构，
 并由 `internal/llm` 的重试/超时层做错误降级；任一 LLM 决策失败都会回退到确定性启发式，Agent 不会卡死。
+
+> **网关兼容开关 `llm.disable_response_format`**：某些兼容网关在 `response_format: json_object`
+> 模式下会污染正文（例如静默删除字符串里的子串 `json`，从而破坏模型生成的代码）。将该项设为
+> `true` 后，改为在提示中要求 JSON，并由宽容解析器(容忍 ```json 代码围栏、`params/arguments`
+> 等多种字段位)提取，既保住结构化输出又不损坏代码。
+
+---
+
+## 让 Agent 自己写代码并执行（沙箱）
+
+`examples/webagent` 是一个动作即“真实代码执行”的环境：LLM 通过 `run_python` / `run_shell`
+自己编写脚本来完成任务(如抓取网页并落盘)，并能 `read_file` 查看上一次的 `stdout`/`stderr`
+从而**自我调试迭代**。
+
+安全边界由 `internal/sandbox` 的一次性 **Docker 容器**保证——这是“让模型写代码”与“可控执行”
+的诚实折中：
+
+- 容器内可真实运行 Python/shell 并**联网**(默认放开所有域名，`network: all`)；
+- **只**把一个 scratch 工作目录 bind-mount 进容器(`/work`)，宿主机其余文件(SSH 密钥、系统文件、
+  本仓库)容器**看不到**；
+- 施加内存 / CPU / PIDs 限制与硬超时；每次执行都作为**注册动作**记入事件、可审计；
+- 仅白名单动作可执行——模型即便生成越权参数也会被 Action Registry 拒绝。
+
+> 若容器运行时是 **Colima**(或其它只共享 `$HOME` 的 VM),工作目录会自动落到
+> `$HOME/.liveagent/<workspace>`,以保证 bind-mount 真正生效(相对路径/`~` 均如此解析)。
+
+跑真实爬虫 Demo：
+
+```bash
+source .env.local                       # LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+docker pull python:3.12-slim            # 首次拉取执行镜像
+go run ./cmd/agent -config configs/webagent.yaml
+```
+
+默认任务是抓取 `quotes.toscrape.com` 首页的 10 条名言并保存为 `results.json`；成功后会反思并把
+可复用的爬取步骤沉淀为一个 **active 技能**(如 `fetch_parse_write`),后续 Episode 直接复用。
 
 ---
 

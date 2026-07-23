@@ -17,7 +17,7 @@ func New(cfg config.LLMConfig) (domain.LLM, error) {
 	case "fake":
 		base = NewFakeLLM()
 	case "openai":
-		p, err := NewOpenAIProvider(OpenAIConfig{Model: cfg.Model, Timeout: cfg.Timeout})
+		p, err := NewOpenAIProvider(OpenAIConfig{Model: cfg.Model, Timeout: cfg.Timeout, DisableResponseFormat: cfg.DisableResponseFormat})
 		if err != nil {
 			return nil, err
 		}

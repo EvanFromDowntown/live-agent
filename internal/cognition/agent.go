@@ -29,6 +29,13 @@ type Agent struct {
 
 	// lastRetrieved caches memory retrieved during SelectGoal for reuse in Plan.
 	lastRetrieved []domain.MemoryItem
+
+	// Plan caching: a plan is executed step-by-step across ticks instead of being
+	// regenerated every tick. This lets multi-step intentions (observe -> move ->
+	// explore) actually unfold, and roughly halves LLM calls.
+	curPlan  *domain.Plan
+	planIdx  int
+	planGoal string
 }
 
 // Deps bundles the collaborators the Agent needs.
@@ -116,15 +123,22 @@ func (a *Agent) SelectGoal(ctx context.Context) (domain.Goal, error) {
 	return chosen, nil
 }
 
-// Plan builds an action sequence for the goal. It prefers an active skill whose
-// tags match the goal; otherwise it asks the LLM and validates every step.
+// Plan returns the plan to pursue for the goal. If a cached plan for the same
+// goal still has unexecuted steps, it is reused (no LLM call); otherwise a new
+// plan is produced — preferring a matching active skill, else the LLM — and
+// cached for step-by-step execution.
 func (a *Agent) Plan(ctx context.Context, goal domain.Goal) (domain.Plan, error) {
+	if a.curPlan != nil && a.planGoal == goal.ID && a.planIdx < len(a.curPlan.Steps) {
+		return *a.curPlan, nil // continue the in-flight plan
+	}
+
 	// 1. Reuse a matching active skill if one exists.
 	if plan, ok := a.planFromSkill(goal); ok {
+		a.setPlan(plan, goal.ID)
 		return plan, nil
 	}
 
-	// 2. Ask the LLM for a plan.
+	// 2. Ask the LLM for a multi-step plan.
 	avail := a.registry.Names()
 	ctxMap := map[string]any{
 		"task":              "plan",
@@ -135,10 +149,12 @@ func (a *Agent) Plan(ctx context.Context, goal domain.Goal) (domain.Plan, error)
 		"body":              a.state.BodyState,
 	}
 	req := domain.LLMRequest{
-		System:    "You output a short action plan. Reply STRICT JSON {\"steps\":[{\"action\":string,\"parameters\":object}],\"rationale\":string}. Only use actions from available_actions.",
-		User:      llm.BuildUserMessage("Produce a plan.", ctxMap),
+		System: "You output a concrete action plan of 3 to 5 ordered steps that make real progress toward the goal. " +
+			"Reply STRICT JSON {\"steps\":[{\"action\":string,\"parameters\":object}],\"rationale\":string}. " +
+			"Only use actions from available_actions. Do NOT repeat the same passive action every step; advance the agent.",
+		User:      llm.BuildUserMessage("Produce a 3-5 step plan.", ctxMap),
 		JSONMode:  true,
-		MaxTokens: 400,
+		MaxTokens: 500,
 	}
 	a.state.ResourceUsage.LLMCalls++
 
@@ -153,22 +169,35 @@ func (a *Agent) Plan(ctx context.Context, goal domain.Goal) (domain.Plan, error)
 		plan.Steps = a.fallbackSteps()
 		plan.Rationale = "fallback: no valid LLM plan"
 	}
+	a.setPlan(plan, goal.ID)
 	return plan, nil
 }
 
-// SelectAction chooses the next executable action from the plan, skipping any
-// action a hard safety constraint forbids under the current body state.
+func (a *Agent) setPlan(plan domain.Plan, goalID string) {
+	p := plan
+	a.curPlan = &p
+	a.planIdx = 0
+	a.planGoal = goalID
+}
+
+// SelectAction returns the next executable step of the cached plan, advancing
+// the plan cursor. Steps that fail validation or violate a hard safety
+// constraint under the current body state are skipped (safety always overrides).
 func (a *Agent) SelectAction(_ context.Context, plan domain.Plan) (domain.Action, error) {
-	for _, step := range plan.Steps {
-		if err := a.registry.Validate(step); err != nil {
-			continue
+	if a.curPlan != nil {
+		for a.planIdx < len(a.curPlan.Steps) {
+			step := a.curPlan.Steps[a.planIdx]
+			a.planIdx++
+			if err := a.registry.Validate(step); err != nil {
+				continue
+			}
+			if d := a.guard.Check(step, a.state.BodyState); !d.Allowed {
+				continue // safety overrides — never surface a forbidden action
+			}
+			return step, nil
 		}
-		if d := a.guard.Check(step, a.state.BodyState); !d.Allowed {
-			continue // safety overrides — never surface a forbidden action
-		}
-		return step, nil
 	}
-	// Degrade to a safe observe/first-available action.
+	// Plan exhausted or unusable: degrade to a safe action (next tick re-plans).
 	for _, name := range a.registry.Names() {
 		act := domain.Action{Name: name, Parameters: map[string]any{}}
 		if a.guard.Check(act, a.state.BodyState).Allowed {

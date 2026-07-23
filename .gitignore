@@ -11,6 +11,7 @@
 # Build artifacts
 /agent
 /bin/
+*.log
 
 # OS / editor
 .DS_Store

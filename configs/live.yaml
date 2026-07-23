@@ -1,79 +1,111 @@
-# GridWorld 场景 + 真实 OpenAI-compatible LLM。
+# GridWorld 场景 + 真实 OpenAI-compatible LLM（高质量目标 + 调优参数）。
 # 端点/模型/密钥全部从环境变量读取，绝不写入本文件：
 #   LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
-# 运行前请先 export 这三个变量（见 README / 下方说明）。
+# 运行前请先 export（或 `source .env.local`）。
 
 agent:
-  name: gridworld-explorer-live
+  name: cartographer-live          # 制图者：一个长期存在、以“绘制完整地图”为使命的 Agent
   db_path: gridworld-live.db
 
 runtime:
-  max_ticks: 20          # 真实 LLM 较慢(约 20s/Tick，含推理)，先跑少量；可用 -max-ticks 覆盖
-  tick_timeout: 60s      # 真实网络调用给足超时
+  max_ticks: 16                    # 真实 LLM 约 20s/Tick；16 Tick 约覆盖 2~3 个 Episode
+  tick_timeout: 90s                # 带推理的模型给足超时
   tick_interval: 0s
   step_mode: false
 
 llm:
-  provider: openai       # 使用 OpenAI-compatible /chat/completions
-  model: ""              # 留空则由 LLM_MODEL 环境变量提供
-  temperature: 0.2
-  max_tokens: 512
-  timeout: 60s
-  max_retries: 2         # 失败重试后仍会降级到启发式，Agent 不会卡死
+  provider: openai
+  model: ""                        # 留空 -> 由 LLM_MODEL 提供
+  temperature: 0.2                 # 低温，决策稳定、JSON 更可靠
+  max_tokens: 640
+  timeout: 90s
+  max_retries: 2                   # 失败重试后仍会降级到启发式，Agent 不会卡死
 
+# —— 奖励权重：塑造“持续学习”的信号 ——
+# 信息增益权重最高，且重复观察已知格子的信息增益为 0 -> 逼迫真正的探索；
+# 低能量风险被重罚 -> 逼迫学会稳态管理；成功完成探索目标给强正反馈。
 reward:
   weights:
-    task_success: 3.0
-    homeostasis: 1.0
-    information_gain: 0.5
+    task_success: 4.0
+    homeostasis: 1.5
+    information_gain: 2.0
     human_feedback: 1.0
-    resource_cost: 0.5
-    risk_cost: 2.0
+    resource_cost: 0.3
+    risk_cost: 2.5
 
+# —— 硬安全约束：始终优先于奖励最大化 ——
 safety:
   constraints:
     - name: no-self-destruct
       type: forbidden_action
       action: self_destruct
       reason: "self-destruction is never permitted"
+    - name: no-strenuous-explore-when-critical
+      type: body_min
+      field: energy
+      value: 10                    # 能量 < 10 时禁止“探索”（高耗动作）
+      applies_to: explore
+      reason: "energy critically low: exploring is unsafe, recover first"
+    - name: no-strenuous-move-when-critical
+      type: body_min
+      field: energy
+      value: 8                     # 能量 < 8 时禁止“移动”
+      applies_to: move
+      reason: "energy critically low: moving is unsafe, recover first"
 
+# —— 进化阈值：候选原则需 2 条证据 + 置信度达标才可激活 ——
 evolution:
   min_evidence: 2
   min_confidence: 0.6
   min_success_rate: 0.0
 
+# —— 人类定义的根目标（Agent 只能在其中选择，不可修改）——
+# 主目标的描述即为高质量的可执行策略指引，直接进入 LLM 的规划提示。
 goals:
-  - id: explore_world
-    description: "Explore as much of the unknown map as possible."
+  - id: map_the_world
+    description: >-
+      Mission: build a COMPLETE map of the world. Systematically discover every
+      reachable cell by alternating observation with movement toward the NEAREST
+      unknown region. Never linger observing an already-known cell (it yields no
+      new information); when the current area is fully seen, move or explore
+      toward unexplored territory. Prefer the `explore` action to advance into
+      unknown regions, and use `observe` only to reveal a freshly reached area.
     priority: 1.0
-    tags: [explore, exploration_task]
-  - id: stay_alive
-    description: "Recover energy and stay healthy."
-    priority: 0.8
-    tags: [recover, survive, energy_low]
+    tags: [explore, exploration_task, discovery, long_horizon_task]
 
+  - id: sustain_energy
+    description: >-
+      Homeostasis: keep energy within a healthy range. When energy falls below
+      the safety margin (~30), stop exploring and recover first — rest to regain
+      energy, or collect a resource if standing on one — then resume the mapping
+      mission.
+    priority: 0.9
+    tags: [recover, survive, energy_low, homeostasis]
+
+# —— 身体状态 schema（字段在此声明，而非硬编码）——
 body:
   fields:
     - {name: energy, initial: 100, min: 0, max: 100}
     - {name: health, initial: 100, min: 0, max: 100}
     - {name: age, initial: 0, min: 0, max: 100000}
 
+# —— 环境参数：更大的地图 + 更高的 observe 成本，防止“靠观察刷分” ——
 environment:
   type: gridworld
   params:
-    width: 6
-    height: 6
-    num_resources: 5
-    num_obstacles: 3
+    width: 7
+    height: 7
+    num_resources: 6
+    num_obstacles: 5
     seed: 42
     init_energy: 100
     max_energy: 100
     init_health: 100
     max_health: 100
-    move_cost: 8
-    explore_cost: 14
-    observe_cost: 1
-    rest_gain: 22
-    collect_gain: 45
-    episode_length: 8
-    explore_goal: 0.6
+    move_cost: 6
+    explore_cost: 10
+    observe_cost: 3                # 抬高观察成本：反复观察已知格子会亏本
+    rest_gain: 25
+    collect_gain: 50
+    episode_length: 6              # 较短 Episode -> 更快积累多次反思与证据
+    explore_goal: 0.7              # 覆盖 70% 可通行格子即算成功（有挑战但可达）

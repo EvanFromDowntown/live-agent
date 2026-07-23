@@ -80,6 +80,14 @@ func New(box *sandbox.Docker, p Params) *Env {
 	}
 }
 
+// Close tears down the long-lived sandbox container.
+func (e *Env) Close() error {
+	if e.box != nil {
+		return e.box.Close()
+	}
+	return nil
+}
+
 // Tick returns the current tick.
 func (e *Env) Tick() int64 {
 	e.mu.Lock()

@@ -197,7 +197,9 @@ func (e *Env) listFiles() []string {
 	var out []string
 	for _, en := range entries {
 		name := en.Name()
-		if strings.HasPrefix(name, ".run_") { // hide transient script files
+		// Hide bookkeeping entries: transient scripts (.run_*) and self-install
+		// dirs (.pydeps, .ms-playwright, HOME caches) — all start with a dot.
+		if strings.HasPrefix(name, ".") {
 			continue
 		}
 		out = append(out, name)

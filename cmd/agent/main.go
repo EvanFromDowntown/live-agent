@@ -76,6 +76,10 @@ func run(cfgPath string, step bool, maxTicks int64) error {
 	if err != nil {
 		return err
 	}
+	// Tear down any long-lived resources (e.g. the sandbox container) on exit.
+	if closer, ok := env.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
 
 	ctx := context.Background()
 

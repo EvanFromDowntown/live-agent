@@ -115,14 +115,19 @@ Provider 使用标准 `/chat/completions`，对目标/计划/反思请求 JSON �
 自己编写脚本来完成任务(如抓取网页并落盘)，并能 `read_file` 查看上一次的 `stdout`/`stderr`
 从而**自我调试迭代**。
 
-安全边界由 `internal/sandbox` 的一次性 **Docker 容器**保证——这是“让模型写代码”与“可控执行”
+安全边界由 `internal/sandbox` 的**常驻 Docker 容器**保证——这是“让模型写代码”与“可控执行”
 的诚实折中：
 
+- 沙箱容器在启动时**起一次**并常驻(`sleep infinity`)，每个动作是一次 `docker exec` 进入该容器；
+- 因此 Agent **自己安装的工具会持久化**——它可以 `run_shell` 执行 `pip install playwright`、
+  `playwright install chromium`、`apt-get install ...`，装一次之后**后续所有 tick 都还在**。
+  能力不必预置，Agent 能**自我扩展**;
 - 容器内可真实运行 Python/shell 并**联网**(默认放开所有域名，`network: all`)；
 - **只**把一个 scratch 工作目录 bind-mount 进容器(`/work`)，宿主机其余文件(SSH 密钥、系统文件、
   本仓库)容器**看不到**；
-- 施加内存 / CPU / PIDs 限制与硬超时；每次执行都作为**注册动作**记入事件、可审计；
-- 仅白名单动作可执行——模型即便生成越权参数也会被 Action Registry 拒绝。
+- 施加内存 / CPU / PIDs 限制与每次 exec 的硬超时；每次执行都作为**注册动作**记入事件、可审计；
+- 仅白名单动作可执行——模型即便生成越权参数也会被 Action Registry 拒绝；
+- 进程退出时自动 `docker rm -f` 清理容器。
 
 > 若容器运行时是 **Colima**(或其它只共享 `$HOME` 的 VM),工作目录会自动落到
 > `$HOME/.liveagent/<workspace>`,以保证 bind-mount 真正生效(相对路径/`~` 均如此解析)。

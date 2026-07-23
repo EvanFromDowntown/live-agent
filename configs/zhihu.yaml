@@ -1,0 +1,107 @@
+# Let the agent autonomously crawl a specific Zhihu question. The agent writes
+# and runs its own Python in the sandbox, observes stdout/stderr, and iterates.
+# Secrets from env only: source .env.local (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL).
+
+agent:
+  name: zhihu-crawler-live
+  db_path: zhihu-live.db
+
+runtime:
+  max_ticks: 8
+  tick_timeout: 240s
+  tick_interval: 0s
+  step_mode: false
+
+llm:
+  provider: openai
+  model: ""
+  temperature: 0.2
+  max_tokens: 4096
+  timeout: 120s
+  max_retries: 1
+  disable_response_format: true
+  disable_thinking: true    # this reasoning model otherwise spends the whole budget on hidden reasoning
+
+reward:
+  weights:
+    task_success: 5.0
+    homeostasis: 0.5
+    information_gain: 1.5
+    human_feedback: 1.0
+    resource_cost: 0.3
+    risk_cost: 1.5
+
+safety:
+  constraints:
+    - name: no-self-destruct
+      type: forbidden_action
+      action: self_destruct
+      reason: "never permitted"
+    - name: no-run-without-budget
+      type: body_min
+      field: budget
+      value: 1
+      applies_to: run_python
+      reason: "out of run budget; must stop running code"
+    - name: no-shell-without-budget
+      type: body_min
+      field: budget
+      value: 1
+      applies_to: run_shell
+      reason: "out of run budget; must stop running code"
+
+evolution:
+  min_evidence: 2
+  min_confidence: 0.6
+  min_success_rate: 0.0
+
+goals:
+  - id: accomplish_task
+    description: >-
+      Accomplish the task by writing and running code. Inspect `world.last_stdout`
+      and `world.last_stderr` from the previous run, then emit a `run_python`
+      action whose code fetches the target and extracts the requested content,
+      saving it to the success file. Prefer the Python standard library. When the
+      success file already has enough records, use `finish`.
+    priority: 1.0
+    tags: [task, code, crawl]
+
+  - id: fix_errors
+    description: >-
+      The previous run failed or returned no usable content (non-zero exit, an
+      error in last_stderr, or an HTTP 403/anti-bot challenge page). Read the
+      output carefully and emit a corrected, SELF-CONTAINED `run_python` action.
+      If blocked by anti-bot (HTTP 403, a "zh-zse-ck" challenge page, empty body),
+      try realistic browser headers (User-Agent, Accept, Accept-Language,
+      Referer), a cookie jar bootstrapped from the homepage, or an alternate
+      endpoint. Do not repeat the same failing code.
+    priority: 0.95
+    tags: [debug, error, code]
+
+body:
+  fields:
+    - {name: budget, initial: 8, min: 0, max: 8}
+    - {name: steps, initial: 0, min: 0, max: 1000}
+
+environment:
+  type: webagent
+  params:
+    task: >-
+      Crawl this Zhihu question page: https://www.zhihu.com/question/747969552 .
+      Fetch the page, extract the question title and as many answers as possible
+      (author + answer text), and save them as a JSON array of objects to
+      result.json in the current working directory. Note: Zhihu aggressively
+      blocks anonymous requests (HTTP 403 + a JS "zh-zse-ck" challenge), so a
+      plain fetch may return no content — adapt using browser-like headers and a
+      cookie jar. Succeeds when result.json contains at least 1 record.
+    start_url: https://www.zhihu.com/question/747969552
+    success_file: result.json
+    success_min: 1
+    max_steps: 8
+    budget: 8
+    image: python:3.12-slim
+    network: all
+    memory_mb: 512
+    cpus: 1
+    timeout_sec: 40
+    workspace: zhihu_workspace

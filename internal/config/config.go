@@ -54,6 +54,12 @@ type LLMConfig struct {
 	// the substring "json" from string values, which breaks generated code). When
 	// disabled, the model is asked for JSON in the prompt and parsed leniently.
 	DisableResponseFormat bool `yaml:"disable_response_format"`
+	// DisableThinking turns off a reasoning model's hidden "thinking" phase by
+	// sending {"thinking":{"type":"disabled"}}. On reasoning-heavy models a hard
+	// task can spend the ENTIRE token budget on reasoning and emit empty content
+	// (finish_reason=length, reasoning_tokens==max_tokens). Disabling thinking
+	// guarantees the model actually returns a plan/code.
+	DisableThinking bool `yaml:"disable_thinking"`
 }
 
 // RewardConfig holds the weights used to scalarise a RewardVector. Weights are

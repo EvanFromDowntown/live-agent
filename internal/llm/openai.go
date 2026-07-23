@@ -23,6 +23,7 @@ type OpenAIProvider struct {
 	model                 string
 	client                *http.Client
 	disableResponseFormat bool
+	disableThinking       bool
 }
 
 // OpenAIConfig configures the provider. Model may be overridden by LLM_MODEL.
@@ -30,6 +31,7 @@ type OpenAIConfig struct {
 	Model                 string
 	Timeout               time.Duration
 	DisableResponseFormat bool
+	DisableThinking       bool
 }
 
 // NewOpenAIProvider builds a provider from env vars LLM_BASE_URL, LLM_API_KEY,
@@ -60,6 +62,7 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		model:                 model,
 		client:                &http.Client{Timeout: timeout},
 		disableResponseFormat: cfg.DisableResponseFormat,
+		disableThinking:       cfg.DisableThinking,
 	}, nil
 }
 
@@ -74,9 +77,14 @@ type chatRequest struct {
 	Temperature    float64         `json:"temperature"`
 	MaxTokens      int             `json:"max_tokens,omitempty"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Thinking       *thinkingParam  `json:"thinking,omitempty"`
 }
 
 type responseFormat struct {
+	Type string `json:"type"`
+}
+
+type thinkingParam struct {
 	Type string `json:"type"`
 }
 
@@ -102,6 +110,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	}
 	if req.JSONMode && !p.disableResponseFormat {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	if p.disableThinking {
+		body.Thinking = &thinkingParam{Type: "disabled"}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

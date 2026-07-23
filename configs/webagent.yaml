@@ -25,6 +25,9 @@ llm:
   # the substring "json" from string values, breaking generated code). Ask for
   # JSON via the prompt instead and rely on lenient parsing.
   disable_response_format: true
+  # Reasoning-heavy tasks can spend the whole token budget on hidden reasoning and
+  # return empty content; disable thinking so the model always emits a plan/code.
+  disable_thinking: true
 
 reward:
   weights:

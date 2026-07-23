@@ -1,3 +1,7 @@
+# Local secrets / env (never commit)
+.env
+.env.*
+
 # SQLite databases created at runtime
 *.db
 *.db-journal

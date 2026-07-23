@@ -8,7 +8,7 @@ agent:
   db_path: gridworld-live.db
 
 runtime:
-  max_ticks: 40          # 接真实 LLM 时先跑少量 Tick，避免过多调用
+  max_ticks: 20          # 真实 LLM 较慢(约 20s/Tick，含推理)，先跑少量；可用 -max-ticks 覆盖
   tick_timeout: 60s      # 真实网络调用给足超时
   tick_interval: 0s
   step_mode: false
@@ -75,5 +75,5 @@ environment:
     observe_cost: 1
     rest_gain: 22
     collect_gain: 45
-    episode_length: 12
+    episode_length: 8
     explore_goal: 0.6

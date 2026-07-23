@@ -8,7 +8,7 @@ agent:
 
 runtime:
   max_ticks: 8
-  tick_timeout: 240s
+  tick_timeout: 600s        # reasoning is on; latency on this hard task is variable
   tick_interval: 0s
   step_mode: false
 
@@ -16,11 +16,12 @@ llm:
   provider: openai
   model: ""
   temperature: 0.2
-  max_tokens: 4096
-  timeout: 120s
+  max_tokens: 65536         # high ceiling so reasoning + content both fit
+  timeout: 180s
   max_retries: 1
   disable_response_format: true
-  disable_thinking: true    # this reasoning model otherwise spends the whole budget on hidden reasoning
+  disable_thinking: false   # reasoning ENABLED
+  reasoning_effort: medium  # keep reasoning on but bounded (unbounded / low run away on this task)
 
 reward:
   weights:

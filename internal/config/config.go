@@ -60,6 +60,11 @@ type LLMConfig struct {
 	// (finish_reason=length, reasoning_tokens==max_tokens). Disabling thinking
 	// guarantees the model actually returns a plan/code.
 	DisableThinking bool `yaml:"disable_thinking"`
+	// ReasoningEffort bounds a reasoning model's hidden reasoning ("low" /
+	// "medium" / "high"). This keeps reasoning ENABLED while preventing it from
+	// running away and consuming the whole token budget (which yields empty
+	// content or multi-minute latency). Empty = model default (unbounded).
+	ReasoningEffort string `yaml:"reasoning_effort"`
 }
 
 // RewardConfig holds the weights used to scalarise a RewardVector. Weights are

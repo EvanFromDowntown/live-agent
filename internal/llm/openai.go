@@ -24,6 +24,7 @@ type OpenAIProvider struct {
 	client                *http.Client
 	disableResponseFormat bool
 	disableThinking       bool
+	reasoningEffort       string
 }
 
 // OpenAIConfig configures the provider. Model may be overridden by LLM_MODEL.
@@ -32,6 +33,7 @@ type OpenAIConfig struct {
 	Timeout               time.Duration
 	DisableResponseFormat bool
 	DisableThinking       bool
+	ReasoningEffort       string
 }
 
 // NewOpenAIProvider builds a provider from env vars LLM_BASE_URL, LLM_API_KEY,
@@ -63,6 +65,7 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		client:                &http.Client{Timeout: timeout},
 		disableResponseFormat: cfg.DisableResponseFormat,
 		disableThinking:       cfg.DisableThinking,
+		reasoningEffort:       cfg.ReasoningEffort,
 	}, nil
 }
 
@@ -72,12 +75,13 @@ type chatMessage struct {
 }
 
 type chatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []chatMessage   `json:"messages"`
-	Temperature    float64         `json:"temperature"`
-	MaxTokens      int             `json:"max_tokens,omitempty"`
-	ResponseFormat *responseFormat `json:"response_format,omitempty"`
-	Thinking       *thinkingParam  `json:"thinking,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []chatMessage   `json:"messages"`
+	Temperature     float64         `json:"temperature"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
+	Thinking        *thinkingParam  `json:"thinking,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 }
 
 type responseFormat struct {
@@ -113,6 +117,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	}
 	if p.disableThinking {
 		body.Thinking = &thinkingParam{Type: "disabled"}
+	}
+	if p.reasoningEffort != "" {
+		body.ReasoningEffort = p.reasoningEffort
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

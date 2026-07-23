@@ -283,7 +283,7 @@ func compactAny(v any, maxStr, maxLen int) any {
 }
 
 func (a *Agent) compactWorld() any {
-	return compactAny(a.state.WorldState, 600, 40)
+	return compactAny(a.state.WorldState, 240, 20)
 }
 
 func toAnySlice(ss []string) []any {

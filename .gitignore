@@ -1,0 +1,14 @@
+# SQLite databases created at runtime
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build artifacts
+/agent
+/bin/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

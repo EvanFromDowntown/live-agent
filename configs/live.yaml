@@ -1,0 +1,79 @@
+# GridWorld 场景 + 真实 OpenAI-compatible LLM。
+# 端点/模型/密钥全部从环境变量读取，绝不写入本文件：
+#   LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+# 运行前请先 export 这三个变量（见 README / 下方说明）。
+
+agent:
+  name: gridworld-explorer-live
+  db_path: gridworld-live.db
+
+runtime:
+  max_ticks: 40          # 接真实 LLM 时先跑少量 Tick，避免过多调用
+  tick_timeout: 60s      # 真实网络调用给足超时
+  tick_interval: 0s
+  step_mode: false
+
+llm:
+  provider: openai       # 使用 OpenAI-compatible /chat/completions
+  model: ""              # 留空则由 LLM_MODEL 环境变量提供
+  temperature: 0.2
+  max_tokens: 512
+  timeout: 60s
+  max_retries: 2         # 失败重试后仍会降级到启发式，Agent 不会卡死
+
+reward:
+  weights:
+    task_success: 3.0
+    homeostasis: 1.0
+    information_gain: 0.5
+    human_feedback: 1.0
+    resource_cost: 0.5
+    risk_cost: 2.0
+
+safety:
+  constraints:
+    - name: no-self-destruct
+      type: forbidden_action
+      action: self_destruct
+      reason: "self-destruction is never permitted"
+
+evolution:
+  min_evidence: 2
+  min_confidence: 0.6
+  min_success_rate: 0.0
+
+goals:
+  - id: explore_world
+    description: "Explore as much of the unknown map as possible."
+    priority: 1.0
+    tags: [explore, exploration_task]
+  - id: stay_alive
+    description: "Recover energy and stay healthy."
+    priority: 0.8
+    tags: [recover, survive, energy_low]
+
+body:
+  fields:
+    - {name: energy, initial: 100, min: 0, max: 100}
+    - {name: health, initial: 100, min: 0, max: 100}
+    - {name: age, initial: 0, min: 0, max: 100000}
+
+environment:
+  type: gridworld
+  params:
+    width: 6
+    height: 6
+    num_resources: 5
+    num_obstacles: 3
+    seed: 42
+    init_energy: 100
+    max_energy: 100
+    init_health: 100
+    max_health: 100
+    move_cost: 8
+    explore_cost: 14
+    observe_cost: 1
+    rest_gain: 22
+    collect_gain: 45
+    episode_length: 12
+    explore_goal: 0.6

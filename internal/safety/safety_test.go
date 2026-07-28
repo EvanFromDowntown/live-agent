@@ -7,37 +7,24 @@ import (
 	"liveagent/internal/domain"
 )
 
-// Criterion 4: an action that violates a hard constraint must be rejected even
-// when its expected reward is very high.
-func TestForbiddenActionRejectedRegardlessOfReward(t *testing.T) {
-	g := NewGuard(config.SafetyConfig{Constraints: []config.ConstraintConfig{
-		{Name: "no-self-destruct", Type: "forbidden_action", Action: "self_destruct", Reason: "never allowed"},
-	}})
-
-	// The reward for this action would be enormous, but safety must still win.
-	act := domain.Action{Name: "self_destruct"}
-	dec := g.Check(act, map[string]any{"energy": 100.0})
-	if dec.Allowed {
-		t.Fatal("forbidden action was allowed despite hard constraint")
+func TestForbiddenAction(t *testing.T) {
+	g := NewGuard(config.SafetyConfig{ForbiddenActions: []string{"run_shell"}})
+	if dec := g.Check(domain.Action{Name: "run_shell"}); dec.Allowed {
+		t.Fatal("expected run_shell to be blocked")
 	}
-	if dec.Constraint != "no-self-destruct" {
-		t.Fatalf("unexpected constraint name %q", dec.Constraint)
+	if dec := g.Check(domain.Action{Name: "read_file"}); !dec.Allowed {
+		t.Fatal("expected read_file to be allowed")
 	}
 }
 
-func TestBodyMinConstraint(t *testing.T) {
-	g := NewGuard(config.SafetyConfig{Constraints: []config.ConstraintConfig{
-		{Name: "no-strenuous-when-exhausted", Type: "body_min", Field: "energy", Value: 10, AppliesTo: "sprint"},
-	}})
-
-	if dec := g.Check(domain.Action{Name: "sprint"}, map[string]any{"energy": 5.0}); dec.Allowed {
-		t.Fatal("expected sprint to be rejected when energy below minimum")
+func TestForbiddenShellPattern(t *testing.T) {
+	g := NewGuard(config.SafetyConfig{ForbiddenShellPatterns: []string{"rm -rf /"}})
+	danger := domain.Action{Name: "run_shell", Parameters: map[string]any{"command": "rm -rf / --no-preserve-root"}}
+	if dec := g.Check(danger); dec.Allowed {
+		t.Fatal("expected dangerous command to be blocked")
 	}
-	if dec := g.Check(domain.Action{Name: "sprint"}, map[string]any{"energy": 50.0}); !dec.Allowed {
-		t.Fatal("expected sprint to be allowed when energy sufficient")
-	}
-	// A different action is unaffected by an action-scoped constraint.
-	if dec := g.Check(domain.Action{Name: "rest"}, map[string]any{"energy": 5.0}); !dec.Allowed {
-		t.Fatal("expected rest to be allowed")
+	safe := domain.Action{Name: "run_shell", Parameters: map[string]any{"command": "ls -la"}}
+	if dec := g.Check(safe); !dec.Allowed {
+		t.Fatal("expected safe command to be allowed")
 	}
 }

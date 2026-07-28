@@ -1,11 +1,12 @@
 // Package safety enforces human-defined hard constraints. A hard constraint
-// ALWAYS overrides reward: an action that violates any constraint is rejected no
-// matter how high its expected reward. Constraints are declarative (from config)
-// and evaluated by built-in checkers only — never by executing arbitrary code.
+// ALWAYS overrides the model's wish: a matching action is rejected before it is
+// ever executed. Constraints are declarative (from config) and evaluated by
+// built-in checkers only — never by executing arbitrary code.
 package safety
 
 import (
 	"fmt"
+	"strings"
 
 	"liveagent/internal/config"
 	"liveagent/internal/domain"
@@ -13,72 +14,51 @@ import (
 
 // Decision is the result of a safety check.
 type Decision struct {
-	Allowed    bool
-	Constraint string
-	Reason     string
+	Allowed bool
+	Reason  string
 }
 
 // Guard evaluates actions against configured hard constraints.
 type Guard struct {
-	constraints []config.ConstraintConfig
+	forbiddenActions map[string]bool
+	forbiddenShell   []string
 }
 
 // NewGuard builds a Guard from config.
 func NewGuard(cfg config.SafetyConfig) *Guard {
-	return &Guard{constraints: cfg.Constraints}
+	fa := make(map[string]bool, len(cfg.ForbiddenActions))
+	for _, a := range cfg.ForbiddenActions {
+		fa[a] = true
+	}
+	return &Guard{forbiddenActions: fa, forbiddenShell: cfg.ForbiddenShellPatterns}
 }
 
-// Check returns a Decision for the given action under the current body state.
-// It is intentionally side-effect free so it can be called during planning and
-// again immediately before execution (defence in depth).
-func (g *Guard) Check(action domain.Action, bodyState map[string]any) Decision {
-	for _, c := range g.constraints {
-		switch c.Type {
-		case "forbidden_action":
-			if c.Action == action.Name {
-				return deny(c, fmt.Sprintf("action %q is forbidden", action.Name))
-			}
-		case "body_min":
-			if c.AppliesTo != "" && c.AppliesTo != action.Name {
-				continue
-			}
-			if v, ok := bodyFloat(bodyState, c.Field); ok && v < c.Value {
-				return deny(c, fmt.Sprintf("body.%s=%.2f is below hard minimum %.2f", c.Field, v, c.Value))
-			}
-		case "body_max":
-			if c.AppliesTo != "" && c.AppliesTo != action.Name {
-				continue
-			}
-			if v, ok := bodyFloat(bodyState, c.Field); ok && v > c.Value {
-				return deny(c, fmt.Sprintf("body.%s=%.2f is above hard maximum %.2f", c.Field, v, c.Value))
+// Check returns a Decision for the given action. It is side-effect free so it
+// can be called during planning and again immediately before execution.
+func (g *Guard) Check(action domain.Action) Decision {
+	if g.forbiddenActions[action.Name] {
+		return Decision{Allowed: false, Reason: fmt.Sprintf("action %q is forbidden by policy", action.Name)}
+	}
+	if len(g.forbiddenShell) > 0 {
+		payload := shellPayload(action)
+		for _, pat := range g.forbiddenShell {
+			if pat != "" && strings.Contains(payload, pat) {
+				return Decision{Allowed: false, Reason: fmt.Sprintf("payload matches forbidden pattern %q", pat)}
 			}
 		}
 	}
 	return Decision{Allowed: true}
 }
 
-func deny(c config.ConstraintConfig, fallback string) Decision {
-	reason := c.Reason
-	if reason == "" {
-		reason = fallback
+// shellPayload extracts the executable text from a code-running action so it can
+// be pattern-checked.
+func shellPayload(a domain.Action) string {
+	var b strings.Builder
+	for _, k := range []string{"script", "code", "command"} {
+		if v, ok := a.Parameters[k].(string); ok {
+			b.WriteString(v)
+			b.WriteByte('\n')
+		}
 	}
-	return Decision{Allowed: false, Constraint: c.Name, Reason: reason}
-}
-
-func bodyFloat(body map[string]any, field string) (float64, bool) {
-	if body == nil {
-		return 0, false
-	}
-	switch n := body[field].(type) {
-	case float64:
-		return n, true
-	case float32:
-		return float64(n), true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	default:
-		return 0, false
-	}
+	return b.String()
 }

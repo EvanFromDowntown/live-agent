@@ -10,27 +10,28 @@ import (
 )
 
 // New builds a domain.LLM from configuration, wrapping it with retry/timeout.
-// Provider "fake" needs no credentials; "openai" reads them from env vars.
+// Only the OpenAI-compatible provider is supported; it reads credentials from
+// environment variables (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL).
 func New(cfg config.LLMConfig) (domain.LLM, error) {
-	var base domain.LLM
 	switch cfg.Provider {
-	case "fake":
-		base = NewFakeLLM()
-	case "openai":
-		p, err := NewOpenAIProvider(OpenAIConfig{Model: cfg.Model, Timeout: cfg.Timeout, DisableResponseFormat: cfg.DisableResponseFormat, DisableThinking: cfg.DisableThinking, ReasoningEffort: cfg.ReasoningEffort})
+	case "openai", "":
+		p, err := NewOpenAIProvider(OpenAIConfig{
+			Model:                 cfg.Model,
+			Timeout:               cfg.Timeout,
+			DisableResponseFormat: cfg.DisableResponseFormat,
+			DisableThinking:       cfg.DisableThinking,
+			ReasoningEffort:       cfg.ReasoningEffort,
+		})
 		if err != nil {
 			return nil, err
 		}
-		base = p
+		return &Retrying{inner: p, retries: cfg.MaxRetries, timeout: cfg.Timeout}, nil
 	default:
 		return nil, fmt.Errorf("llm: unknown provider %q", cfg.Provider)
 	}
-	return &Retrying{inner: base, retries: cfg.MaxRetries, timeout: cfg.Timeout}, nil
 }
 
-// Retrying wraps a domain.LLM with a per-call timeout and bounded retries. This
-// is the "error degradation" layer: after exhausting retries it returns the last
-// error and the caller falls back to a heuristic.
+// Retrying wraps a domain.LLM with a per-call timeout and bounded retries.
 type Retrying struct {
 	inner   domain.LLM
 	retries int

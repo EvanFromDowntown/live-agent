@@ -74,9 +74,22 @@ type chatMessage struct {
 	Content string `json:"content"`
 }
 
+type toolFunctionDef struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type toolDefWire struct {
+	Type     string          `json:"type"`
+	Function toolFunctionDef `json:"function"`
+}
+
 type chatRequest struct {
 	Model           string          `json:"model"`
 	Messages        []chatMessage   `json:"messages"`
+	Tools           []toolDefWire   `json:"tools,omitempty"`
+	ToolChoice      string          `json:"tool_choice,omitempty"`
 	Temperature     float64         `json:"temperature"`
 	MaxTokens       int             `json:"max_tokens,omitempty"`
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
@@ -92,9 +105,22 @@ type thinkingParam struct {
 	Type string `json:"type"`
 }
 
+type toolCallWire struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type chatResponse struct {
 	Choices []struct {
-		Message chatMessage `json:"message"`
+		Message struct {
+			Role      string         `json:"role"`
+			Content   string         `json:"content"`
+			ToolCalls []toolCallWire `json:"tool_calls"`
+		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
@@ -103,16 +129,31 @@ type chatResponse struct {
 
 // Generate implements domain.LLM.
 func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (domain.LLMResponse, error) {
+	msgs := make([]chatMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
+	}
 	body := chatRequest{
-		Model: p.model,
-		Messages: []chatMessage{
-			{Role: "system", Content: req.System},
-			{Role: "user", Content: req.User},
-		},
+		Model:       p.model,
+		Messages:    msgs,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 	}
-	if req.JSONMode && !p.disableResponseFormat {
+	if len(req.Tools) > 0 {
+		body.Tools = make([]toolDefWire, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			body.Tools = append(body.Tools, toolDefWire{
+				Type:     "function",
+				Function: toolFunctionDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters},
+			})
+		}
+		if req.ToolChoice != "" {
+			body.ToolChoice = req.ToolChoice
+		}
+	}
+	// response_format(JSON mode) and tool-calling are mutually exclusive on many
+	// gateways; only request JSON mode when NOT using tools.
+	if req.JSONMode && !p.disableResponseFormat && len(req.Tools) == 0 {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	if p.disableThinking {
@@ -149,10 +190,14 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	if len(parsed.Choices) == 0 {
 		return domain.LLMResponse{}, fmt.Errorf("llm: empty choices")
 	}
-	return domain.LLMResponse{
-		Text:       parsed.Choices[0].Message.Content,
-		TokensUsed: parsed.Usage.TotalTokens,
-	}, nil
+	msg := parsed.Choices[0].Message
+	out := domain.LLMResponse{Text: msg.Content, TokensUsed: parsed.Usage.TotalTokens}
+	for _, tc := range msg.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, domain.ToolCall{
+			ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
+		})
+	}
+	return out, nil
 }
 
 func truncate(s string, n int) string {

@@ -1,0 +1,50 @@
+# General agent configuration. The TASK is NOT here — it is provided at runtime
+# via stdin or the -task flag. Credentials are read from the environment only:
+# LLM_BASE_URL / LLM_API_KEY / LLM_MODEL.
+
+agent:
+  name: agent
+  db_path: agent.db
+  workspace: workspace
+  # system_prompt: optional extra guidance appended to the built-in operating prompt.
+
+llm:
+  provider: openai
+  model: ""                    # overridden by LLM_MODEL env
+  temperature: 0.2
+  max_tokens: 65536            # high ceiling so reasoning + tool args both fit
+  timeout: 180s
+  max_retries: 1
+  disable_response_format: true
+  disable_thinking: false      # reasoning ENABLED
+  reasoning_effort: medium     # bounded reasoning
+
+limits:
+  max_steps: 80
+  max_repeats: 3               # stop if the exact same tool call repeats this many times
+  max_consecutive_errors: 6
+  stall_nudge: 5               # after N unproductive steps, prod the model to bank results / change tack
+  step_timeout: 400s           # a single shell/python step (pip install, browser download, crawl)
+
+verify:
+  enabled: true                # independently verify a finish(success=true) claim (LLM-as-judge)
+  max_rejections: 2            # times a finish may be rejected and the run forced to continue
+
+learn:
+  enabled: true                # distill lessons from VERIFIED-successful runs and recall them into similar tasks
+  max_inject: 3                # max recalled lessons injected into a run's context
+  evict_min_uses: 8            # prune lessons surfaced >= N times that never contributed to a verified win (0 disables)
+  embed_model: ""              # OpenAI-compatible embeddings model for semantic recall; empty (or LLM_EMBED_MODEL env) => lexical fallback
+
+context:
+  max_chars: 60000
+  keep_recent: 6
+  compact_at_pct: 0.75
+
+safety:
+  forbidden_actions: []
+  forbidden_shell_patterns:
+    - "rm -rf /"
+    - ":(){ :|:& };:"
+    - "mkfs"
+    - "dd if=/dev/zero of=/dev"

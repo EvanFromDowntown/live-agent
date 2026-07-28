@@ -1,6 +1,7 @@
-// Package config loads the human-authored YAML configuration. Everything the
-// human controls (root goals, reward weights, safety constraints, body schema,
-// loop limits) lives here and is treated as immutable by the Agent at runtime.
+// Package config loads the agent's runtime configuration from YAML. The config
+// is deliberately small: everything task-specific (the actual task text) comes
+// in at runtime via stdin, not from a file. Credentials are NEVER read from
+// config — the LLM provider reads them from environment variables only.
 package config
 
 import (
@@ -11,140 +12,120 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the top-level configuration document.
+// Config is the whole configuration tree.
 type Config struct {
-	Agent       AgentConfig       `yaml:"agent"`
-	Runtime     RuntimeConfig     `yaml:"runtime"`
-	LLM         LLMConfig         `yaml:"llm"`
-	Reward      RewardConfig      `yaml:"reward"`
-	Safety      SafetyConfig      `yaml:"safety"`
-	Evolution   EvolutionConfig   `yaml:"evolution"`
-	Goals       []GoalConfig      `yaml:"goals"`
-	Body        BodyConfig        `yaml:"body"`
-	Environment EnvironmentConfig `yaml:"environment"`
+	Agent   AgentConfig   `yaml:"agent"`
+	LLM     LLMConfig     `yaml:"llm"`
+	Limits  LimitsConfig  `yaml:"limits"`
+	Context ContextConfig `yaml:"context"`
+	Safety  SafetyConfig  `yaml:"safety"`
+	Verify  VerifyConfig  `yaml:"verify"`
+	Learn   LearnConfig   `yaml:"learn"`
 }
 
-// AgentConfig holds identity/persistence settings.
+// AgentConfig identifies the agent and where it persists state / runs work.
 type AgentConfig struct {
-	// Name is a stable human label; the AgentID is derived/persisted so that
-	// restarts recover the same identity.
-	Name   string `yaml:"name"`
+	// Name is a stable human label used to recover the same identity on restart.
+	Name string `yaml:"name"`
+	// DBPath is the SQLite file for events/episodes/notes.
 	DBPath string `yaml:"db_path"`
+	// Workspace is the directory shell/python actions run in. Created if missing.
+	Workspace string `yaml:"workspace"`
+	// SystemPrompt OPTIONALLY extends (appends to) the built-in, task-agnostic
+	// operating prompt. Empty uses the built-in default alone.
+	SystemPrompt string `yaml:"system_prompt"`
 }
 
-// RuntimeConfig controls the main loop.
-type RuntimeConfig struct {
-	MaxTicks     int64         `yaml:"max_ticks"`     // 0 = unlimited
-	TickTimeout  time.Duration `yaml:"tick_timeout"`  // per-tick deadline
-	TickInterval time.Duration `yaml:"tick_interval"` // sleep between ticks
-	StepMode     bool          `yaml:"step_mode"`     // run a single tick and stop
-}
-
-// LLMConfig selects and configures the cognitive module.
+// LLMConfig configures the cognitive module. Provider "openai" reads
+// LLM_BASE_URL / LLM_API_KEY / LLM_MODEL from the environment.
 type LLMConfig struct {
-	// Provider is "fake" or "openai". Secrets come from env vars only.
 	Provider    string        `yaml:"provider"`
 	Model       string        `yaml:"model"`
-	Temperature float64       `yaml:"temperature"`
-	MaxTokens   int           `yaml:"max_tokens"`
 	Timeout     time.Duration `yaml:"timeout"`
 	MaxRetries  int           `yaml:"max_retries"`
-	// DisableResponseFormat turns off the OpenAI `response_format: json_object`
-	// hint. Some gateways corrupt content in JSON mode (e.g. silently stripping
-	// the substring "json" from string values, which breaks generated code). When
-	// disabled, the model is asked for JSON in the prompt and parsed leniently.
+	Temperature float64       `yaml:"temperature"`
+	MaxTokens   int           `yaml:"max_tokens"`
+	// DisableResponseFormat avoids response_format:json_object on gateways that
+	// corrupt the request; irrelevant while tool-calling is active.
 	DisableResponseFormat bool `yaml:"disable_response_format"`
-	// DisableThinking turns off a reasoning model's hidden "thinking" phase by
-	// sending {"thinking":{"type":"disabled"}}. On reasoning-heavy models a hard
-	// task can spend the ENTIRE token budget on reasoning and emit empty content
-	// (finish_reason=length, reasoning_tokens==max_tokens). Disabling thinking
-	// guarantees the model actually returns a plan/code.
-	DisableThinking bool `yaml:"disable_thinking"`
-	// ReasoningEffort bounds a reasoning model's hidden reasoning ("low" /
-	// "medium" / "high"). This keeps reasoning ENABLED while preventing it from
-	// running away and consuming the whole token budget (which yields empty
-	// content or multi-minute latency). Empty = model default (unbounded).
-	ReasoningEffort string `yaml:"reasoning_effort"`
+	// DisableThinking / ReasoningEffort bound reasoning-model token spend.
+	DisableThinking bool   `yaml:"disable_thinking"`
+	ReasoningEffort string `yaml:"reasoning_effort"` // "", "low", "medium", "high"
 }
 
-// RewardConfig holds the weights used to scalarise a RewardVector. Weights are
-// human-defined and the Agent may not change them.
-type RewardConfig struct {
-	Weights RewardWeights `yaml:"weights"`
+// LimitsConfig bounds a run so it always terminates.
+type LimitsConfig struct {
+	// MaxSteps caps the number of tool calls in one run.
+	MaxSteps int `yaml:"max_steps"`
+	// MaxRepeats stops the run when the SAME tool call (name+args) is emitted
+	// this many times in a row (spinning in place).
+	MaxRepeats int `yaml:"max_repeats"`
+	// MaxConsecutiveErrors stops the run after this many failing steps in a row.
+	MaxConsecutiveErrors int `yaml:"max_consecutive_errors"`
+	// StallNudge injects a convergence warning into the ask after this many
+	// consecutive UNPRODUCTIVE steps (errors or byte-identical repeated output).
+	// It does not stop the run; it prods the model to bank results / change tack.
+	StallNudge int `yaml:"stall_nudge"`
+	// StepTimeout bounds a single shell/python action.
+	StepTimeout time.Duration `yaml:"step_timeout"`
 }
 
-// RewardWeights maps each reward dimension to a scalar weight.
-type RewardWeights struct {
-	TaskSuccess     float64 `yaml:"task_success"`
-	Homeostasis     float64 `yaml:"homeostasis"`
-	InformationGain float64 `yaml:"information_gain"`
-	HumanFeedback   float64 `yaml:"human_feedback"`
-	ResourceCost    float64 `yaml:"resource_cost"`
-	RiskCost        float64 `yaml:"risk_cost"`
+// VerifyConfig controls objective, independent verification of a finish claim
+// (LLM-as-judge). It makes the reported success signal meaningful instead of a
+// pure self-report.
+type VerifyConfig struct {
+	// Enabled turns on verification of finish(success=true) claims. Omitted
+	// defaults to true; set explicitly to false to disable.
+	Enabled *bool `yaml:"enabled"`
+	// MaxRejections caps how many times a finish may be rejected and the run
+	// forced to continue before the finish is accepted (as unverified).
+	MaxRejections int `yaml:"max_rejections"`
 }
 
-// SafetyConfig defines hard constraints that always override reward.
+// On reports whether verification is enabled (nil => default on).
+func (v VerifyConfig) On() bool { return v.Enabled == nil || *v.Enabled }
+
+// LearnConfig controls the verified-learning loop: distilling reusable lessons
+// from VERIFIED-successful runs and recalling them into later similar tasks.
+type LearnConfig struct {
+	// Enabled turns learning on. Omitted defaults to true.
+	Enabled *bool `yaml:"enabled"`
+	// MaxInject caps how many recalled lessons are injected into a run's context.
+	MaxInject int `yaml:"max_inject"`
+	// EvictMinUses prunes lessons surfaced at least this many times that never
+	// contributed to a verified win (wins=0). Zero disables eviction.
+	EvictMinUses int `yaml:"evict_min_uses"`
+	// EmbedModel enables semantic recall via an OpenAI-compatible /embeddings
+	// endpoint (credentials from env). Empty (and no LLM_EMBED_MODEL env) falls
+	// back to lexical word-overlap recall.
+	EmbedModel string `yaml:"embed_model"`
+}
+
+// On reports whether learning is enabled (nil => default on).
+func (l LearnConfig) On() bool { return l.Enabled == nil || *l.Enabled }
+
+// ContextConfig controls the rolling transcript / compaction.
+type ContextConfig struct {
+	// MaxChars is the transcript budget (~tokens*4). Compaction fires at
+	// CompactAtPct of this. Zero uses a sensible default.
+	MaxChars int `yaml:"max_chars"`
+	// KeepRecent is how many recent turns are kept verbatim during compaction.
+	KeepRecent int `yaml:"keep_recent"`
+	// CompactAtPct (0..1) is the fraction of MaxChars that triggers compaction.
+	CompactAtPct float64 `yaml:"compact_at_pct"`
+}
+
+// SafetyConfig holds hard constraints. A hard constraint ALWAYS overrides the
+// model's wish: a matching action is rejected before execution.
 type SafetyConfig struct {
-	Constraints []ConstraintConfig `yaml:"constraints"`
+	// ForbiddenActions are tool names the agent may never call.
+	ForbiddenActions []string `yaml:"forbidden_actions"`
+	// ForbiddenShellPatterns are substrings that, if present in a run_shell /
+	// run_python payload, cause rejection (e.g. "rm -rf /", ":(){").
+	ForbiddenShellPatterns []string `yaml:"forbidden_shell_patterns"`
 }
 
-// ConstraintConfig is one declarative hard constraint. We only support a small
-// set of built-in constraint types so nothing arbitrary is ever evaluated.
-type ConstraintConfig struct {
-	Name string `yaml:"name"`
-	// Type is one of: "forbidden_action", "body_min", "body_max".
-	Type string `yaml:"type"`
-	// Action is used by "forbidden_action".
-	Action string `yaml:"action"`
-	// Field/Value are used by body_min / body_max (compares body_state[field]).
-	Field string  `yaml:"field"`
-	Value float64 `yaml:"value"`
-	// AppliesTo optionally restricts a body constraint to a specific action;
-	// empty means it applies to every action.
-	AppliesTo string `yaml:"applies_to"`
-	Reason    string `yaml:"reason"`
-}
-
-// EvolutionConfig controls principle/skill lifecycles.
-type EvolutionConfig struct {
-	// MinEvidence is how many corroborating experiences a principle needs
-	// before it may be activated.
-	MinEvidence int `yaml:"min_evidence"`
-	// MinConfidence is the confidence threshold for activation.
-	MinConfidence float64 `yaml:"min_confidence"`
-	// MinSuccessRate is the historical success-rate threshold for activation.
-	MinSuccessRate float64 `yaml:"min_success_rate"`
-}
-
-// GoalConfig is a human-defined (root) goal.
-type GoalConfig struct {
-	ID          string   `yaml:"id"`
-	Description string   `yaml:"description"`
-	Priority    float64  `yaml:"priority"`
-	Tags        []string `yaml:"tags"`
-}
-
-// BodyConfig defines the body-state schema. Body fields are NOT hard-coded in
-// Go; they are declared here so new embodiments can add fields freely.
-type BodyConfig struct {
-	Fields []BodyField `yaml:"fields"`
-}
-
-// BodyField declares one proprioceptive/body variable.
-type BodyField struct {
-	Name    string  `yaml:"name"`
-	Initial float64 `yaml:"initial"`
-	Min     float64 `yaml:"min"`
-	Max     float64 `yaml:"max"`
-}
-
-// EnvironmentConfig is a free-form map interpreted by the selected environment.
-type EnvironmentConfig struct {
-	Type   string         `yaml:"type"`
-	Params map[string]any `yaml:"params"`
-}
-
-// Load reads and validates a YAML config file.
+// Load reads and validates a YAML config, filling in defaults.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -155,10 +136,14 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	c.applyDefaults()
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	return &c, nil
+}
+
+// Default returns a config with only defaults applied (no file).
+func Default() *Config {
+	c := &Config{}
+	c.applyDefaults()
+	return c
 }
 
 func (c *Config) applyDefaults() {
@@ -168,44 +153,51 @@ func (c *Config) applyDefaults() {
 	if c.Agent.DBPath == "" {
 		c.Agent.DBPath = "agent.db"
 	}
-	if c.Runtime.TickTimeout == 0 {
-		c.Runtime.TickTimeout = 30 * time.Second
+	if c.Agent.Workspace == "" {
+		c.Agent.Workspace = "workspace"
 	}
 	if c.LLM.Provider == "" {
-		c.LLM.Provider = "fake"
+		c.LLM.Provider = "openai"
 	}
 	if c.LLM.Timeout == 0 {
-		c.LLM.Timeout = 30 * time.Second
-	}
-	if c.LLM.MaxRetries == 0 {
-		c.LLM.MaxRetries = 1
+		c.LLM.Timeout = 180 * time.Second
 	}
 	if c.LLM.MaxTokens == 0 {
-		c.LLM.MaxTokens = 1024
+		c.LLM.MaxTokens = 4096
 	}
-	if c.Evolution.MinEvidence == 0 {
-		c.Evolution.MinEvidence = 2
+	if c.LLM.MaxRetries == 0 {
+		c.LLM.MaxRetries = 2
 	}
-	if c.Evolution.MinConfidence == 0 {
-		c.Evolution.MinConfidence = 0.6
+	if c.Limits.MaxSteps == 0 {
+		c.Limits.MaxSteps = 30
 	}
-}
-
-func (c *Config) validate() error {
-	if len(c.Goals) == 0 {
-		return fmt.Errorf("config: at least one goal must be defined")
+	if c.Limits.MaxRepeats == 0 {
+		c.Limits.MaxRepeats = 3
 	}
-	switch c.LLM.Provider {
-	case "fake", "openai":
-	default:
-		return fmt.Errorf("config: unknown llm.provider %q", c.LLM.Provider)
+	if c.Limits.MaxConsecutiveErrors == 0 {
+		c.Limits.MaxConsecutiveErrors = 6
 	}
-	for _, con := range c.Safety.Constraints {
-		switch con.Type {
-		case "forbidden_action", "body_min", "body_max":
-		default:
-			return fmt.Errorf("config: unknown constraint type %q", con.Type)
-		}
+	if c.Limits.StallNudge == 0 {
+		c.Limits.StallNudge = 5
 	}
-	return nil
+	if c.Limits.StepTimeout == 0 {
+		c.Limits.StepTimeout = 120 * time.Second
+	}
+	if c.Verify.MaxRejections == 0 {
+		c.Verify.MaxRejections = 2
+	}
+	if c.Context.MaxChars == 0 {
+		c.Context.MaxChars = 48000
+	}
+	if c.Context.KeepRecent == 0 {
+		c.Context.KeepRecent = 6
+	}
+	if c.Context.CompactAtPct == 0 {
+		c.Context.CompactAtPct = 0.75
+	}
+	if c.Learn.MaxInject == 0 {
+		c.Learn.MaxInject = 3
+	}
+	// EvictMinUses intentionally has no default: 0 disables eviction. Set it in
+	// config to enable pruning of chronically-unhelpful lessons.
 }

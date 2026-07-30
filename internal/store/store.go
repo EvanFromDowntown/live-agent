@@ -89,13 +89,23 @@ func nowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 // StartEpisode records a new task attempt and returns its id.
 func (s *Store) StartEpisode(ctx context.Context, agent, task string) (string, error) {
 	id := fmt.Sprintf("ep_%d", time.Now().UnixNano())
+	if err := s.StartEpisodeID(ctx, id, agent, task); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// StartEpisodeID records a new episode under a caller-chosen id. The web layer
+// uses this so one id identifies the whole session (workspace dir, episode,
+// event stream) even across many conversational turns.
+func (s *Store) StartEpisodeID(ctx context.Context, id, agent, task string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO episodes(id, agent, task, started_at) VALUES(?,?,?,?)`,
 		id, agent, task, nowUTC())
 	if err != nil {
-		return "", fmt.Errorf("store: start episode: %w", err)
+		return fmt.Errorf("store: start episode: %w", err)
 	}
-	return id, nil
+	return nil
 }
 
 // RecordEvent appends one tool call + result to an episode. args is marshalled
@@ -120,6 +130,20 @@ func (s *Store) RecordEvent(ctx context.Context, episodeID string, step int, too
 	return nil
 }
 
+// InterruptOrphans marks any episode still flagged "running" as "interrupted".
+// Turns are serialised in-memory, so at process start none can legitimately be
+// running; such rows are leftovers from a crash or restart mid-turn. Returns
+// how many rows were fixed.
+func (s *Store) InterruptOrphans(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE episodes SET status='interrupted', ended_at=? WHERE status='running'`, nowUTC())
+	if err != nil {
+		return 0, fmt.Errorf("store: interrupt orphans: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // EndEpisode finalises an episode with its outcome.
 func (s *Store) EndEpisode(ctx context.Context, episodeID, status, summary string, steps int) error {
 	_, err := s.db.ExecContext(ctx,
@@ -129,6 +153,80 @@ func (s *Store) EndEpisode(ctx context.Context, episodeID, status, summary strin
 		return fmt.Errorf("store: end episode: %w", err)
 	}
 	return nil
+}
+
+// EpisodeRow is a summary of one past run, for listing in a UI.
+type EpisodeRow struct {
+	ID        string `json:"id"`
+	Task      string `json:"task"`
+	Status    string `json:"status"`
+	Steps     int    `json:"steps"`
+	StartedAt string `json:"started_at"`
+	Summary   string `json:"summary"`
+}
+
+// ListEpisodes returns recent episodes for an agent, newest first.
+func (s *Store) ListEpisodes(ctx context.Context, agent string, limit int) ([]EpisodeRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, task, status, steps, started_at, COALESCE(summary,'')
+		   FROM episodes WHERE agent=? ORDER BY started_at DESC LIMIT ?`, agent, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EpisodeRow
+	for rows.Next() {
+		var e EpisodeRow
+		if err := rows.Scan(&e.ID, &e.Task, &e.Status, &e.Steps, &e.StartedAt, &e.Summary); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EventRow is one recorded tool call + result within an episode.
+type EventRow struct {
+	Step    int    `json:"step"`
+	Tool    string `json:"tool"`
+	Args    string `json:"args"`
+	Result  string `json:"result"`
+	IsError bool   `json:"is_error"`
+}
+
+// EpisodeEvents returns the ordered events of one episode.
+func (s *Store) EpisodeEvents(ctx context.Context, episodeID string) ([]EventRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT step, tool, COALESCE(args,''), COALESCE(result,''), is_error
+		   FROM events WHERE episode_id=? ORDER BY id ASC`, episodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		var e EventRow
+		var ie int
+		if err := rows.Scan(&e.Step, &e.Tool, &e.Args, &e.Result, &ie); err != nil {
+			return nil, err
+		}
+		e.IsError = ie != 0
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EpisodeMeta returns one episode's summary row by id.
+func (s *Store) EpisodeMeta(ctx context.Context, id string) (EpisodeRow, error) {
+	var e EpisodeRow
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, task, status, steps, started_at, COALESCE(summary,'')
+		   FROM episodes WHERE id=?`, id).
+		Scan(&e.ID, &e.Task, &e.Status, &e.Steps, &e.StartedAt, &e.Summary)
+	return e, err
 }
 
 // SaveNote persists a lesson and returns its row id.

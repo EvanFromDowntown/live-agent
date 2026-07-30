@@ -13,10 +13,22 @@ import (
 // Only the OpenAI-compatible provider is supported; it reads credentials from
 // environment variables (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL).
 func New(cfg config.LLMConfig) (domain.LLM, error) {
+	return NewModel(cfg, "", "", "")
+}
+
+// NewModel is like New but takes explicit connection overrides (base URL, API
+// key, model) — used by the web UI so a session can pick its model and endpoint
+// at runtime. Empty overrides fall back to config / env.
+func NewModel(cfg config.LLMConfig, baseURL, apiKey, model string) (domain.LLM, error) {
 	switch cfg.Provider {
 	case "openai", "":
+		if model == "" {
+			model = cfg.Model
+		}
 		p, err := NewOpenAIProvider(OpenAIConfig{
-			Model:                 cfg.Model,
+			BaseURL:               baseURL,
+			APIKey:                apiKey,
+			Model:                 model,
 			Timeout:               cfg.Timeout,
 			DisableResponseFormat: cfg.DisableResponseFormat,
 			DisableThinking:       cfg.DisableThinking,

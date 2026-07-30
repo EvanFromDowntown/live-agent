@@ -27,8 +27,12 @@ type OpenAIProvider struct {
 	reasoningEffort       string
 }
 
-// OpenAIConfig configures the provider. Model may be overridden by LLM_MODEL.
+// OpenAIConfig configures the provider. BaseURL / APIKey / Model may be given
+// explicitly (e.g. chosen in the UI); when empty they fall back to the env vars
+// LLM_BASE_URL / LLM_API_KEY / LLM_MODEL.
 type OpenAIConfig struct {
+	BaseURL               string
+	APIKey                string
 	Model                 string
 	Timeout               time.Duration
 	DisableResponseFormat bool
@@ -36,14 +40,21 @@ type OpenAIConfig struct {
 	ReasoningEffort       string
 }
 
-// NewOpenAIProvider builds a provider from env vars LLM_BASE_URL, LLM_API_KEY,
-// LLM_MODEL. It returns an error if required values are missing.
+// NewOpenAIProvider builds a provider, preferring explicit config values and
+// falling back to env vars LLM_BASE_URL / LLM_API_KEY / LLM_MODEL. It returns an
+// error if required values are missing.
 func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
-	base := strings.TrimRight(os.Getenv("LLM_BASE_URL"), "/")
-	key := os.Getenv("LLM_API_KEY")
-	model := os.Getenv("LLM_MODEL")
+	base := strings.TrimRight(cfg.BaseURL, "/")
+	if base == "" {
+		base = strings.TrimRight(os.Getenv("LLM_BASE_URL"), "/")
+	}
+	key := cfg.APIKey
+	if key == "" {
+		key = os.Getenv("LLM_API_KEY")
+	}
+	model := cfg.Model
 	if model == "" {
-		model = cfg.Model
+		model = os.Getenv("LLM_MODEL")
 	}
 	if base == "" {
 		return nil, fmt.Errorf("llm: LLM_BASE_URL is not set")
@@ -117,9 +128,11 @@ type toolCallWire struct {
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Role      string         `json:"role"`
-			Content   string         `json:"content"`
-			ToolCalls []toolCallWire `json:"tool_calls"`
+			Role             string         `json:"role"`
+			Content          string         `json:"content"`
+			ReasoningContent string         `json:"reasoning_content"` // GLM/DeepSeek-style thinking
+			Reasoning        string         `json:"reasoning"`         // alternative field name
+			ToolCalls        []toolCallWire `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
@@ -191,11 +204,65 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 		return domain.LLMResponse{}, fmt.Errorf("llm: empty choices")
 	}
 	msg := parsed.Choices[0].Message
-	out := domain.LLMResponse{Text: msg.Content, TokensUsed: parsed.Usage.TotalTokens}
+	reasoning := msg.ReasoningContent
+	if reasoning == "" {
+		reasoning = msg.Reasoning
+	}
+	out := domain.LLMResponse{Text: msg.Content, Reasoning: reasoning, TokensUsed: parsed.Usage.TotalTokens}
 	for _, tc := range msg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, domain.ToolCall{
 			ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
 		})
+	}
+	return out, nil
+}
+
+// FetchModels lists model ids from an OpenAI-compatible /models endpoint.
+// Values fall back to the env vars when empty, mirroring provider construction.
+func FetchModels(ctx context.Context, baseURL, apiKey string, timeout time.Duration) ([]string, error) {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		base = strings.TrimRight(os.Getenv("LLM_BASE_URL"), "/")
+	}
+	key := apiKey
+	if key == "" {
+		key = os.Getenv("LLM_API_KEY")
+	}
+	if base == "" {
+		return nil, fmt.Errorf("llm: base URL not set")
+	}
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llm: list models: %w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("llm: models status %d: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, fmt.Errorf("llm: decode models: %w", err)
+	}
+	out := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if strings.TrimSpace(m.ID) != "" {
+			out = append(out, m.ID)
+		}
 	}
 	return out, nil
 }

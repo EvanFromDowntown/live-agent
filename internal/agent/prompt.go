@@ -12,14 +12,28 @@ import (
 // DefaultSystemPrompt is the framework-level, task-agnostic operating context.
 // It does NOT assume a particular operating system: the concrete environment is
 // probed at runtime and injected into the dynamic context block each step.
-const DefaultSystemPrompt = `You are an autonomous agent that completes real software and office tasks by
-taking actions on the machine you run on. The specifics of that environment
-(operating system, shell, available interpreters, working directory, network
-access) are provided at runtime in the context block below — read them and adapt.
-Do NOT assume a particular operating system. You act by calling EXACTLY ONE tool
-per step, then see its real result and decide the next step.
+const DefaultSystemPrompt = `You are an autonomous agent in a long-lived conversation. You both chat with the
+user AND complete real software and office tasks by taking actions on the machine
+you run on. The specifics of that environment (operating system, shell, available
+interpreters, working directory, network access) are provided at runtime in the
+context block below — read them and adapt. Do NOT assume a particular operating
+system. You act by calling EXACTLY ONE tool per step, then see its real result and
+decide the next step.
 
-Operating principles:
+Choosing a mode (decide this yourself, every user message):
+- If the message needs NO work on the machine — a greeting, a question you can
+  answer from knowledge or the conversation, a clarification — just answer it with
+  the reply tool. That ends the turn in a single step. Do NOT make a plan or run
+  commands for this.
+- If the message requires doing something on the machine (creating/reading files,
+  running commands, fetching data, multi-step work), enter task mode: optionally
+  sketch a short plan, take actions one tool at a time, verify, and call finish
+  when the success criteria are met.
+- The session continues after every turn: finishing a task or answering a question
+  does NOT end the conversation. The workspace and history persist, so later turns
+  can build on earlier work.
+
+Operating principles (task mode):
 - You may install what you need when the environment permits. If a tool or
   library is missing, FIRST install it in its own step using the package manager
   appropriate for the current environment, confirm it succeeded, and only THEN
@@ -79,14 +93,16 @@ func (a *Agent) buildAsk() string {
 	if len(a.plan) > 0 {
 		block["plan"] = a.plan
 	} else {
-		block["plan"] = "empty — call update_plan first"
+		block["plan"] = "empty (only needed for multi-step tasks)"
 	}
 	if len(a.lessons) > 0 {
 		block["lessons_from_past_runs"] = a.lessons
 	}
 	b, _ := json.MarshalIndent(block, "", "  ")
-	ask := "Take the next single action toward the task by calling exactly one tool. " +
-		"Advance the plan; correct any error shown above.\n\nCONTEXT:\n" + string(b)
+	ask := "Respond to the latest USER message in the conversation above by calling exactly one tool. " +
+		"If it needs no work on the machine, answer directly with the reply tool. " +
+		"Otherwise take the next single action toward it, advance the plan, correct any error shown above, " +
+		"and call finish when its success criteria are met.\n\nCONTEXT:\n" + string(b)
 	if a.cfg != nil && a.cfg.Limits.StallNudge > 0 && a.stallStreak >= a.cfg.Limits.StallNudge {
 		ask += fmt.Sprintf("\n\nWARNING: the last %d steps made no new progress (errors or repeated output). "+
 			"If you ALREADY have results that meet the success criteria, save them to the required output and call finish NOW. "+

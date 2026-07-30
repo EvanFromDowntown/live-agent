@@ -41,6 +41,16 @@ func newTranscript(maxChars, keepRecent int, compactAtPct float64) *transcript {
 	}
 }
 
+// addUser records a real user message as a user turn (distinct from a tool
+// RESULT), so multi-turn conversations read naturally to the model.
+func (t *transcript) addUser(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	t.turns = append(t.turns, domain.Message{Role: "user", Content: "USER: " + text})
+}
+
 // addAction records the assistant's tool call as an assistant turn.
 func (t *transcript) addAction(name, arguments string) {
 	content := "TOOL_CALL " + name

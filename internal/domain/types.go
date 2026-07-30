@@ -76,6 +76,7 @@ type LLMRequest struct {
 // native function-calling.
 type LLMResponse struct {
 	Text       string     `json:"text"`
+	Reasoning  string     `json:"reasoning,omitempty"` // model's thinking, when the provider exposes it
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	TokensUsed int        `json:"tokens_used"`
 }

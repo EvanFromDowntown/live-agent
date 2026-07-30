@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# Runtime UI model-connection settings (may hold an internal endpoint)
+ui-settings.json
+
 # SQLite databases created at runtime
 *.db
 *.db-journal
@@ -16,6 +19,9 @@
 # Sandbox scratch workspace (agent-generated code/output; default lives under
 # $HOME/.liveagent, but ignore any stray copy created in the repo)
 /sandbox_workspace/
+
+# Per-run/-session agent workspaces created by the web server
+/workspace/
 
 # OS / editor
 .DS_Store

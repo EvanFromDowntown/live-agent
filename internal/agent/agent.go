@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"liveagent/internal/config"
 	"liveagent/internal/domain"
@@ -31,6 +32,7 @@ type Deps struct {
 	Logger          *slog.Logger
 	Workdir         string
 	PromptExtension string
+	OnEvent         Emitter // optional; receives structured progress events
 }
 
 // Agent runs tasks. One Agent may run many tasks; per-task state is reset in Run.
@@ -45,15 +47,19 @@ type Agent struct {
 
 	workdir         string
 	promptExtension string
+	onEvent         Emitter
 
-	// per-run state
+	// per-session state (persists across conversational turns)
 	tx        *transcript
-	task      string
+	task      string // the session's standing goal (first user message)
 	env       map[string]any
 	plan      planItems
-	lessons   []string // recalled lesson texts injected this run
+	lessons   []string // recalled lesson texts injected this session
 	lessonIDs []int64  // note ids behind a.lessons, for reinforcement
+	epID      string   // episode/session id; one id for the whole conversation
+	step      int      // monotonically increasing step counter across turns
 
+	// per-turn state (reset at the start of each turn)
 	stallStreak      int             // consecutive unproductive steps
 	seenOutputs      map[string]bool // output fingerprints, for novelty
 	verifyRejections int             // times a finish was rejected by the verifier
@@ -72,46 +78,141 @@ func New(d Deps) *Agent {
 	return &Agent{
 		llm: d.LLM, embedder: d.Embedder, tools: d.Tools, store: d.Store, guard: d.Guard,
 		cfg: cfg, logger: logger, workdir: d.Workdir, promptExtension: d.PromptExtension,
+		onEvent: d.OnEvent,
 	}
 }
 
-// RunResult reports how a task run ended.
+// SetLLM swaps the cognitive model for this agent. The web layer uses it to
+// honour a per-session (or per-turn) model choice from the UI.
+func (a *Agent) SetLLM(m domain.LLM) {
+	if m != nil {
+		a.llm = m
+	}
+}
+
+// SetEmitter rebinds the progress emitter. A long-lived session's agent is
+// reused across HTTP turns, each with its own response stream, so the emitter
+// must be swapped in before every turn.
+func (a *Agent) SetEmitter(e Emitter) { a.onEvent = e }
+
+// RunResult reports how a turn ended.
 type RunResult struct {
 	EpisodeID  string
 	Steps      int
 	Finished   bool
 	Success    bool
 	Verified   bool // an independent verifier confirmed the success claim
+	Reply      bool // the turn ended with a direct conversational answer
 	Summary    string
-	StopReason string // "finish" | "finish_unverified" | "max_steps" | "repeat" | "errors"
+	StopReason string // "finish" | "finish_unverified" | "reply" | "max_steps" | "repeat" | "errors"
 }
 
-// Run drives one task to completion (or a limit).
+// Run drives one task to completion in a fresh, single-turn session. Kept for
+// the CLI and tests; the web layer uses StartSession + RunTurn for long-lived,
+// multi-turn conversations.
 func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
-	a.task = strings.TrimSpace(task)
+	if _, err := a.StartSession(ctx, "", task); err != nil {
+		return RunResult{}, err
+	}
+	return a.RunTurn(ctx, task), nil
+}
+
+// StartSession begins a fresh, persistent conversation under a caller-chosen id
+// (empty auto-generates one). All session state — transcript, workspace, plan,
+// recalled lessons — survives across turns, so the conversation keeps going
+// after a task finishes or a question is answered.
+func (a *Agent) StartSession(ctx context.Context, id, firstTask string) (string, error) {
+	a.task = strings.TrimSpace(firstTask)
 	a.env = probeEnvironment(a.workdir)
 	a.plan = nil
-	a.stallStreak = 0
-	a.verifyRejections = 0
 	a.seenOutputs = map[string]bool{}
+	a.step = 0
 	a.tx = newTranscript(a.cfg.Context.MaxChars, a.cfg.Context.KeepRecent, a.cfg.Context.CompactAtPct)
 	a.lessons = a.recallLessons(ctx)
 
-	epID, err := a.store.StartEpisode(ctx, a.cfg.Agent.Name, a.task)
-	if err != nil {
-		return RunResult{}, err
+	if strings.TrimSpace(id) == "" {
+		id = fmt.Sprintf("ep_%d", time.Now().UnixNano())
 	}
-	a.logger.Info("run.start", "episode", epID, "task", a.task, "os", a.env["os"], "lessons", len(a.lessons))
+	if err := a.store.StartEpisodeID(ctx, id, a.cfg.Agent.Name, a.task); err != nil {
+		return "", err
+	}
+	a.epID = id
+	osStr, _ := a.env["os"].(string)
+	a.logger.Info("session.start", "episode", id, "task", a.task, "os", osStr, "lessons", len(a.lessons))
+	a.emit(Event{Type: "start", EpisodeID: id, Text: a.task, Lessons: len(a.lessons), OS: osStr})
+	return id, nil
+}
 
+// Rehydrate rebuilds an existing session's in-memory state from stored events
+// so the conversation can continue after the live session was lost (e.g. a
+// server restart). The workspace directory is expected to still exist on disk.
+func (a *Agent) Rehydrate(ctx context.Context, id, task string, events []store.EventRow) {
+	a.task = strings.TrimSpace(task)
+	a.env = probeEnvironment(a.workdir)
+	a.plan = nil
+	a.seenOutputs = map[string]bool{}
+	a.tx = newTranscript(a.cfg.Context.MaxChars, a.cfg.Context.KeepRecent, a.cfg.Context.CompactAtPct)
+	a.epID = id
+	a.lessons = a.recallLessons(ctx)
+
+	maxStep := 0
+	for _, e := range events {
+		if e.Step > maxStep {
+			maxStep = e.Step
+		}
+		switch e.Tool {
+		case "(user)":
+			a.tx.addUser(e.Result)
+		case "(assistant)":
+			a.tx.turns = append(a.tx.turns, domain.Message{Role: "assistant", Content: e.Result})
+		case "update_plan", "finish", "(no_tool_call)", "(llm_error)":
+			// meta / noise: skip
+		default:
+			a.tx.addAction(e.Tool, e.Args)
+			a.tx.addResult(e.Result, e.IsError)
+		}
+	}
+	a.step = maxStep
+	osStr, _ := a.env["os"].(string)
+	a.logger.Info("session.rehydrate", "episode", id, "events", len(events), "step", maxStep)
+	a.emit(Event{Type: "start", EpisodeID: id, Text: a.task, Lessons: len(a.lessons), OS: osStr})
+}
+
+// sayMessage surfaces the model's prose to observers and records it so the
+// conversation can be replayed later.
+func (a *Agent) sayMessage(ctx context.Context, step int, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	a.emit(Event{Type: "message", Step: step, Text: truncate(text, maxEventText)})
+	_ = a.store.RecordEvent(ctx, a.epID, step, "(assistant)", nil, text, false)
+}
+
+// RunTurn advances the session by one user message: it records the message,
+// then loops (one tool per step) until the model answers with reply, calls
+// finish, or a limit trips. Session state persists so the next turn continues
+// with full context.
+func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
+	userMsg = strings.TrimSpace(userMsg)
+	a.tx.addUser(userMsg)
+	_ = a.store.RecordEvent(ctx, a.epID, a.step, "(user)", nil, userMsg, false)
+
+	// per-turn reset
+	a.stallStreak = 0
+	a.verifyRejections = 0
 	var lastKey string
 	repeats, errStreak := 0, 0
 	maxSteps := a.cfg.Limits.MaxSteps
+	epID := a.epID
 
-	for step := 1; step <= maxSteps; step++ {
+	for i := 1; i <= maxSteps; i++ {
 		if err := ctx.Err(); err != nil {
-			_ = a.store.EndEpisode(ctx, epID, "cancelled", "context cancelled", step-1)
-			return RunResult{EpisodeID: epID, Steps: step - 1, StopReason: "cancelled"}, err
+			_ = a.store.EndEpisode(ctx, epID, "cancelled", "context cancelled", a.step)
+			return RunResult{EpisodeID: epID, Steps: a.step, StopReason: "cancelled"}
 		}
+		a.step++
+		step := a.step
 
 		a.tx.compactIfNeeded(ctx, a.summarize)
 		req := domain.LLMRequest{
@@ -127,14 +228,28 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 			a.logger.Warn("llm.error", "step", step, "err", err.Error())
 			a.tx.addResult("LLM call failed: "+err.Error(), true)
 			_ = a.store.RecordEvent(ctx, epID, step, "(llm_error)", nil, err.Error(), true)
+			a.emit(Event{Type: "warn", Step: step, Text: "LLM call failed: " + err.Error(), IsError: true})
 			if errStreak++; errStreak >= a.cfg.Limits.MaxConsecutiveErrors {
-				return a.stop(ctx, epID, step, "errors", "too many consecutive LLM errors"), nil
+				return a.stop(ctx, epID, step, "errors", "too many consecutive LLM errors")
 			}
 			continue
 		}
 
+		// Surface the model's reasoning ("thinking") for this step, when the
+		// provider exposes it, so observers can watch how it decides.
+		if rz := strings.TrimSpace(resp.Reasoning); rz != "" {
+			a.emit(Event{Type: "think", Step: step, Text: truncate(rz, maxEventText)})
+		}
+
 		tc, ok := firstToolCall(resp)
-		if !ok {
+		if ok {
+			// A native tool call plus any accompanying prose is a real response.
+			// For reply, the answer is emitted from the tool result itself, so we
+			// skip the accompanying prose to avoid showing it twice.
+			if tc.Name != "reply" {
+				a.sayMessage(ctx, step, resp.Text)
+			}
+		} else {
 			// Some models (especially via gateways) emit the call as TEXT that
 			// imitates the transcript ("TOOL_CALL <name> <json>") instead of a
 			// native tool_call. Recover a registered call from the text before
@@ -142,16 +257,18 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 			if rec, rok := a.recoverToolCall(resp.Text); rok {
 				tc, ok = rec, true
 				a.logger.Info("recovered_tool_call", "step", step, "tool", tc.Name)
+				a.emit(Event{Type: "info", Step: step, Text: "recovered tool call from text: " + tc.Name})
 			}
 		}
 		if !ok {
-			nudge := "No tool was called. You MUST advance by calling exactly one tool."
+			a.sayMessage(ctx, step, resp.Text)
+			nudge := "No tool was called. You MUST advance by calling exactly one tool (use reply to answer the user directly)."
 			a.logger.Warn("no_tool_call", "step", step, "text", truncate(resp.Text, 160))
-			a.tx.turns = append(a.tx.turns, domain.Message{Role: "assistant", Content: strings.TrimSpace(resp.Text)})
 			a.tx.addResult(nudge, true)
 			_ = a.store.RecordEvent(ctx, epID, step, "(no_tool_call)", nil, resp.Text, true)
+			a.emit(Event{Type: "warn", Step: step, Text: "model replied without calling a tool", IsError: true})
 			if errStreak++; errStreak >= a.cfg.Limits.MaxConsecutiveErrors {
-				return a.stop(ctx, epID, step, "errors", "model kept replying without calling a tool"), nil
+				return a.stop(ctx, epID, step, "errors", "model kept replying without calling a tool")
 			}
 			continue
 		}
@@ -163,8 +280,9 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 			a.tx.addAction(tc.Name, tc.Arguments)
 			a.tx.addResult("BLOCKED by safety policy: "+dec.Reason, true)
 			_ = a.store.RecordEvent(ctx, epID, step, tc.Name, act.Parameters, "BLOCKED: "+dec.Reason, true)
+			a.emit(Event{Type: "step", Step: step, Tool: tc.Name, Args: act.Parameters, Output: "BLOCKED by safety policy: " + dec.Reason, IsError: true})
 			if errStreak++; errStreak >= a.cfg.Limits.MaxConsecutiveErrors {
-				return a.stop(ctx, epID, step, "errors", "repeatedly attempted blocked actions"), nil
+				return a.stop(ctx, epID, step, "errors", "repeatedly attempted blocked actions")
 			}
 			continue
 		}
@@ -183,8 +301,12 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 		a.tx.addResult(res.Output, res.IsError)
 		_ = a.store.RecordEvent(ctx, epID, step, tc.Name, act.Parameters, res.Output, res.IsError)
 
+		if tc.Name != "finish" && tc.Name != "reply" {
+			a.emit(Event{Type: "step", Step: step, Tool: tc.Name, Args: act.Parameters, Output: res.Output, IsError: res.IsError})
+		}
 		if res.HasPlan {
 			a.plan = res.Plan
+			a.emit(Event{Type: "plan", Step: step, Plan: res.Plan})
 		}
 		if res.IsError {
 			errStreak++
@@ -192,6 +314,15 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 			errStreak = 0
 		}
 		a.updateStall(tc.Name, res)
+
+		// A direct conversational answer ends the turn without task verification;
+		// the session stays open for whatever comes next.
+		if res.Reply {
+			_ = a.store.EndEpisode(ctx, epID, "idle", res.Output, a.step)
+			a.emit(Event{Type: "message", Step: step, Text: truncate(res.Output, maxEventText)})
+			a.logger.Info("turn.reply", "episode", epID, "steps", a.step)
+			return RunResult{EpisodeID: epID, Steps: a.step, Finished: true, Reply: true, Summary: res.Output, StopReason: "reply"}
+		}
 
 		if res.Finished {
 			// Verify a positive success claim independently before trusting it.
@@ -203,22 +334,27 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 						a.logger.Warn("finish.rejected", "step", step, "reason", reason, "n", a.verifyRejections)
 						a.tx.addResult("FINISH REJECTED by an independent verifier: "+reason+
 							" Keep working; only call finish when the success criteria are truly met and the evidence exists.", true)
+						a.emit(Event{Type: "verify", Step: step, IsError: true, Text: "finish rejected by verifier: " + reason})
 						continue
 					}
 					_ = a.store.EndEpisode(ctx, epID, "finished_unverified", res.Output, step)
 					a.logger.Warn("run.finish_unverified", "episode", epID, "reason", reason, "steps", step)
+					a.emit(Event{Type: "finish", Step: step, Success: false, Verified: false, StopReason: "finish_unverified",
+						Summary: res.Output + " [UNVERIFIED: " + reason + "]"})
 					return RunResult{EpisodeID: epID, Steps: step, Finished: true, Success: false, Verified: false,
-						Summary: res.Output + " [UNVERIFIED: " + reason + "]", StopReason: "finish_unverified"}, nil
+						Summary: res.Output + " [UNVERIFIED: " + reason + "]", StopReason: "finish_unverified"}
 				}
 				_ = a.store.EndEpisode(ctx, epID, "success", res.Output, step)
 				a.logger.Info("run.finish", "episode", epID, "success", true, "verified", decided, "steps", step)
 				if decided && verified {
+					a.emit(Event{Type: "verify", Step: step, Success: true, Verified: true, Text: "verifier confirmed success"})
 					a.creditLessons(ctx)             // reward lessons that were in play
 					a.distillLesson(ctx, res.Output) // learn only from grounded success
 					a.evictWeakLessons(ctx)          // prune chronically-unhelpful lessons
 				}
+				a.emit(Event{Type: "finish", Step: step, Success: true, Verified: decided && verified, StopReason: "finish", Summary: res.Output})
 				return RunResult{EpisodeID: epID, Steps: step, Finished: true, Success: true, Verified: decided && verified,
-					Summary: res.Output, StopReason: "finish"}, nil
+					Summary: res.Output, StopReason: "finish"}
 			}
 			status := "finished"
 			if res.Success {
@@ -226,22 +362,24 @@ func (a *Agent) Run(ctx context.Context, task string) (RunResult, error) {
 			}
 			_ = a.store.EndEpisode(ctx, epID, status, res.Output, step)
 			a.logger.Info("run.finish", "episode", epID, "success", res.Success, "steps", step)
-			return RunResult{EpisodeID: epID, Steps: step, Finished: true, Success: res.Success, Summary: res.Output, StopReason: "finish"}, nil
+			a.emit(Event{Type: "finish", Step: step, Success: res.Success, Verified: false, StopReason: "finish", Summary: res.Output})
+			return RunResult{EpisodeID: epID, Steps: step, Finished: true, Success: res.Success, Summary: res.Output, StopReason: "finish"}
 		}
 		if repeats >= a.cfg.Limits.MaxRepeats {
-			return a.stop(ctx, epID, step, "repeat", fmt.Sprintf("same action %q repeated %d times", tc.Name, repeats)), nil
+			return a.stop(ctx, epID, step, "repeat", fmt.Sprintf("same action %q repeated %d times", tc.Name, repeats))
 		}
 		if errStreak >= a.cfg.Limits.MaxConsecutiveErrors {
-			return a.stop(ctx, epID, step, "errors", "too many consecutive failing steps"), nil
+			return a.stop(ctx, epID, step, "errors", "too many consecutive failing steps")
 		}
 	}
 
-	return a.stop(ctx, epID, maxSteps, "max_steps", "reached step limit"), nil
+	return a.stop(ctx, epID, a.step, "max_steps", "reached step limit")
 }
 
 func (a *Agent) stop(ctx context.Context, epID string, step int, reason, detail string) RunResult {
 	_ = a.store.EndEpisode(ctx, epID, "stopped:"+reason, detail, step)
 	a.logger.Warn("run.stop", "episode", epID, "reason", reason, "detail", detail, "steps", step)
+	a.emit(Event{Type: "stop", Step: step, StopReason: reason, Summary: detail})
 	return RunResult{EpisodeID: epID, Steps: step, StopReason: reason, Summary: detail}
 }
 

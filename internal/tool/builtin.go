@@ -42,6 +42,7 @@ func (b *Builtins) RegisterAll(ts *Toolset) {
 	ts.Register(&readFileTool{b})
 	ts.Register(&writeFileTool{b})
 	ts.Register(&httpFetchTool{b})
+	ts.Register(&replyTool{})
 	ts.Register(&updatePlanTool{})
 	ts.Register(&finishTool{})
 }
@@ -231,6 +232,38 @@ func (t *httpFetchTool) Execute(ctx context.Context, args map[string]any) Result
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxOutput*2))
 	out := fmt.Sprintf("HTTP %d\n%s", resp.StatusCode, clip(string(body)))
 	return Result{Output: out, IsError: resp.StatusCode >= 400}
+}
+
+// -----------------------------------------------------------------------------
+// reply
+// -----------------------------------------------------------------------------
+
+// replyTool is the "single-step return" the model chooses when the user's
+// message needs no actions on the machine — a question, a greeting, a
+// clarification. It ends the current turn with a direct answer and skips the
+// task machinery (plan, verification). For anything requiring work on the
+// host (files, commands, fetching), the model should use the action tools and
+// finish instead.
+type replyTool struct{}
+
+func (t *replyTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "reply",
+		Description: "Answer the user directly and end this turn WITHOUT doing any work on the machine. " +
+			"Use this for greetings, questions, explanations, or clarifications — anything you can answer from knowledge or the conversation so far. " +
+			"Do NOT use this if the request requires running commands, reading/writing files, or fetching data: use the action tools and finish for that.",
+		Parameters: map[string]domain.ParamSpec{
+			"text": {Type: "string", Required: true, Description: "The answer to show the user."},
+		},
+	}
+}
+
+func (t *replyTool) Execute(_ context.Context, args map[string]any) Result {
+	text := str(args, "text")
+	if strings.TrimSpace(text) == "" {
+		return Result{IsError: true, Output: "text is empty"}
+	}
+	return Result{Reply: true, Output: text}
 }
 
 // -----------------------------------------------------------------------------

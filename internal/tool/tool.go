@@ -27,6 +27,9 @@ type Result struct {
 	Finished bool
 	// Success is the model's claim of goal achievement (finish tool only).
 	Success bool
+	// Reply marks a direct conversational answer (the reply tool): the turn ends
+	// immediately with no task verification. Output carries the answer text.
+	Reply bool
 	// Plan / HasPlan are set by update_plan to replace the pinned plan.
 	Plan    []PlanItem
 	HasPlan bool

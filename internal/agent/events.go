@@ -10,9 +10,10 @@ const maxEventText = 8000
 // a web UI) can render the loop in real time. It mirrors what is logged, but in
 // a machine-friendly shape.
 type Event struct {
-	Type       string          `json:"type"` // start|step|plan|info|warn|verify|finish|stop
+	Type       string          `json:"type"` // start|delta|think|message|step|plan|info|warn|verify|finish|stop
 	EpisodeID  string          `json:"episode_id,omitempty"`
 	Step       int             `json:"step,omitempty"`
+	Kind       string          `json:"kind,omitempty"` // for delta events: "think" | "message"
 	Tool       string          `json:"tool,omitempty"`
 	Args       map[string]any  `json:"args,omitempty"`
 	Output     string          `json:"output,omitempty"`

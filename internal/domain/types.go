@@ -36,10 +36,13 @@ type Action struct {
 // LLM
 // -----------------------------------------------------------------------------
 
-// Message is one chat turn. Role is "system", "user", or "assistant".
+// Message is one chat turn. Role is "system", "user", or "assistant". Images,
+// when set on a user message, are sent to vision-capable models as image parts
+// (each entry is a data: URI or an http(s) URL) alongside the text Content.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
 }
 
 // ToolDef describes a callable tool (native function-calling). Parameters is a
@@ -85,4 +88,19 @@ type LLMResponse struct {
 // what we put into the prompt.
 type LLM interface {
 	Generate(ctx context.Context, request LLMRequest) (LLMResponse, error)
+}
+
+// StreamDelta is one incremental chunk produced during streaming generation.
+// Exactly one of the fields is typically non-empty per call.
+type StreamDelta struct {
+	Reasoning string // incremental "thinking" text
+	Content   string // incremental answer/prose text
+}
+
+// StreamingLLM is optionally implemented by providers that can stream tokens.
+// GenerateStream invokes onDelta for each chunk as it arrives and returns the
+// fully-assembled response (same shape as Generate) once the stream completes.
+type StreamingLLM interface {
+	LLM
+	GenerateStream(ctx context.Context, request LLMRequest, onDelta func(StreamDelta)) (LLMResponse, error)
 }

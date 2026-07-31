@@ -48,6 +48,33 @@ func NewEmbedder(model string, timeout time.Duration) (*OpenAIEmbedder, error) {
 	return &OpenAIEmbedder{baseURL: base, apiKey: key, model: model, client: &http.Client{Timeout: timeout}}, nil
 }
 
+// NewEmbedderFrom builds an Embedder from explicit connection values, used by
+// the web UI so the embedding endpoint can be configured independently of the
+// chat gateway. Empty base/key fall back to the chat env vars. Returns nil (a
+// true nil, safe for interface assignment) when no model is configured or the
+// connection is incomplete — semantic recall is then simply disabled.
+func NewEmbedderFrom(baseURL, apiKey, model string, timeout time.Duration) *OpenAIEmbedder {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = strings.TrimRight(os.Getenv("LLM_BASE_URL"), "/")
+	}
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		key = os.Getenv("LLM_API_KEY")
+	}
+	if base == "" || key == "" {
+		return nil
+	}
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	return &OpenAIEmbedder{baseURL: base, apiKey: key, model: model, client: &http.Client{Timeout: timeout}}
+}
+
 // Model returns the configured embedding model name.
 func (e *OpenAIEmbedder) Model() string { return e.model }
 

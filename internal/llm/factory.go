@@ -77,3 +77,36 @@ func (r *Retrying) Generate(ctx context.Context, req domain.LLMRequest) (domain.
 	}
 	return domain.LLMResponse{}, fmt.Errorf("llm: generate failed after %d attempts: %w", attempts, lastErr)
 }
+
+// GenerateStream implements domain.StreamingLLM. It delegates to a streaming
+// inner provider (bounded by the caller's context, not a fixed per-call
+// deadline, so long streams are not truncated). If the inner provider does not
+// support streaming it falls back to a single blocking Generate. Retries stop
+// once any token has been emitted, to avoid showing duplicated partial output.
+func (r *Retrying) GenerateStream(ctx context.Context, req domain.LLMRequest, onDelta func(domain.StreamDelta)) (domain.LLMResponse, error) {
+	s, ok := r.inner.(domain.StreamingLLM)
+	if !ok {
+		return r.Generate(ctx, req)
+	}
+	attempts := r.retries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		emitted := false
+		wrapped := func(d domain.StreamDelta) {
+			emitted = true
+			onDelta(d)
+		}
+		resp, err := s.GenerateStream(ctx, req, wrapped)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil || emitted {
+			break
+		}
+	}
+	return domain.LLMResponse{}, fmt.Errorf("llm: stream failed after %d attempts: %w", attempts, lastErr)
+}

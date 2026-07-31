@@ -7,9 +7,12 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -58,11 +61,23 @@ type Agent struct {
 	lessonIDs []int64  // note ids behind a.lessons, for reinforcement
 	epID      string   // episode/session id; one id for the whole conversation
 	step      int      // monotonically increasing step counter across turns
+	titleSet  bool     // whether the session already has a title (LLM- or auto-set)
 
 	// per-turn state (reset at the start of each turn)
 	stallStreak      int             // consecutive unproductive steps
 	seenOutputs      map[string]bool // output fingerprints, for novelty
 	verifyRejections int             // times a finish was rejected by the verifier
+	pendingImages    []string        // data-URI images to attach to the first LLM call
+}
+
+// Attachment is a file the user attached to a turn. It already lives in the
+// session workspace (under ./uploads). Image marks files that should be sent to
+// a vision-capable model as image parts (decided by the caller per settings).
+type Attachment struct {
+	Name  string // path relative to the workspace, e.g. "uploads/photo.png"
+	Path  string // absolute path on disk
+	Mime  string
+	Image bool
 }
 
 // New builds an Agent.
@@ -127,6 +142,7 @@ func (a *Agent) StartSession(ctx context.Context, id, firstTask string) (string,
 	a.plan = nil
 	a.seenOutputs = map[string]bool{}
 	a.step = 0
+	a.titleSet = false
 	a.tx = newTranscript(a.cfg.Context.MaxChars, a.cfg.Context.KeepRecent, a.cfg.Context.CompactAtPct)
 	a.lessons = a.recallLessons(ctx)
 
@@ -165,7 +181,7 @@ func (a *Agent) Rehydrate(ctx context.Context, id, task string, events []store.E
 			a.tx.addUser(e.Result)
 		case "(assistant)":
 			a.tx.turns = append(a.tx.turns, domain.Message{Role: "assistant", Content: e.Result})
-		case "update_plan", "finish", "(no_tool_call)", "(llm_error)":
+		case "update_plan", "finish", "set_title", "(no_tool_call)", "(llm_error)":
 			// meta / noise: skip
 		default:
 			a.tx.addAction(e.Tool, e.Args)
@@ -179,28 +195,165 @@ func (a *Agent) Rehydrate(ctx context.Context, id, task string, events []store.E
 }
 
 // sayMessage surfaces the model's prose to observers and records it so the
-// conversation can be replayed later.
-func (a *Agent) sayMessage(ctx context.Context, step int, text string) {
+// conversation can be replayed later. When streamed is true the prose was
+// already shown live via delta events, so it is only recorded (not re-emitted).
+func (a *Agent) sayMessage(ctx context.Context, step int, text string, streamed bool) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
 	}
-	a.emit(Event{Type: "message", Step: step, Text: truncate(text, maxEventText)})
+	if !streamed {
+		a.emit(Event{Type: "message", Step: step, Text: truncate(text, maxEventText)})
+	}
 	_ = a.store.RecordEvent(ctx, a.epID, step, "(assistant)", nil, text, false)
+}
+
+// maxVisionBytes bounds a single image sent to the model (as base64), and
+// maxVisionImages caps how many are sent per turn, to keep requests sane.
+const (
+	maxVisionBytes  = 5 << 20
+	maxVisionImages = 6
+)
+
+// prepareAttachments turns image attachments (marked Image=true and small
+// enough) into base64 data URIs for the first LLM call. Non-image or oversized
+// files are left as workspace files the tools can read.
+func (a *Agent) prepareAttachments(atts []Attachment) []string {
+	var out []string
+	for _, at := range atts {
+		if !at.Image || len(out) >= maxVisionImages {
+			continue
+		}
+		data, err := os.ReadFile(at.Path)
+		if err != nil || len(data) == 0 || len(data) > maxVisionBytes {
+			continue
+		}
+		mt := at.Mime
+		if mt == "" {
+			mt = "image/" + strings.TrimPrefix(strings.ToLower(filepath.Ext(at.Name)), ".")
+		}
+		out = append(out, "data:"+mt+";base64,"+base64.StdEncoding.EncodeToString(data))
+	}
+	return out
+}
+
+// attachmentNote is a short line listing attached files so the agent knows they
+// exist (and where) even when they are not sent as images.
+func attachmentNote(atts []Attachment) string {
+	if len(atts) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(atts))
+	for _, at := range atts {
+		names = append(names, at.Name)
+	}
+	return "[The user attached these files, saved in the workspace: " + strings.Join(names, ", ") +
+		". Read them with read_file (or the image/pdf tools) as needed.]"
+}
+
+func isImageName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		return true
+	}
+	return false
+}
+
+// MarkTitled records that the session already has a title (e.g. a rehydrated
+// session that was named in a previous life), so EnsureTitle is a no-op.
+func (a *Agent) MarkTitled() { a.titleSet = true }
+
+// EnsureTitle guarantees the session has a short, LLM-authored title. If the
+// model already named it via set_title this is a no-op; otherwise it makes one
+// small LLM call to summarise the topic, stores it and emits a title event.
+// hint is the current turn's summary/answer, used as extra context.
+func (a *Agent) EnsureTitle(ctx context.Context, hint string) {
+	if a.titleSet || a.store == nil {
+		return
+	}
+	sys := "Produce a concise conversation title of 3-6 words summarising the topic. " +
+		"Reply with ONLY the title text: no quotes, no trailing punctuation, no prefix."
+	user := "First user message:\n" + a.task
+	if h := strings.TrimSpace(hint); h != "" {
+		user += "\n\nAssistant response:\n" + truncate(h, 600)
+	}
+	resp, err := a.llm.Generate(ctx, domain.LLMRequest{
+		Messages: []domain.Message{{Role: "system", Content: sys}, {Role: "user", Content: user}},
+		Temperature: 0.3,
+		// Give reasoning models room to think AND still emit the title as content;
+		// too small a budget gets consumed entirely by hidden reasoning.
+		MaxTokens: 256,
+	})
+	if err != nil {
+		return
+	}
+	title := strings.TrimSpace(resp.Text)
+	if title == "" { // reasoning-only reply: fall back to the last thinking line
+		if rz := strings.TrimSpace(resp.Reasoning); rz != "" {
+			lines := strings.Split(rz, "\n")
+			title = strings.TrimSpace(lines[len(lines)-1])
+		}
+	}
+	title = strings.Trim(title, "\"'“”")
+	if i := strings.IndexAny(title, "\n\r"); i >= 0 {
+		title = strings.TrimSpace(title[:i])
+	}
+	if title == "" {
+		return
+	}
+	if len(title) > 120 {
+		title = title[:120]
+	}
+	a.titleSet = true
+	_ = a.store.SetEpisodeTitle(ctx, a.epID, title)
+	a.emit(Event{Type: "title", Step: a.step, Text: title})
+	a.logger.Info("session.title.auto", "episode", a.epID, "title", title)
+}
+
+// generate runs the model for one step. If the provider supports streaming,
+// reasoning/prose tokens are emitted as delta events as they arrive and the
+// returned streamed flag is true (so the caller does not re-emit the full text).
+// Otherwise it falls back to a single blocking call.
+func (a *Agent) generate(ctx context.Context, req domain.LLMRequest, step int) (domain.LLMResponse, bool, error) {
+	s, ok := a.llm.(domain.StreamingLLM)
+	if !ok {
+		resp, err := a.llm.Generate(ctx, req)
+		return resp, false, err
+	}
+	streamed := false
+	resp, err := s.GenerateStream(ctx, req, func(d domain.StreamDelta) {
+		if d.Reasoning != "" {
+			streamed = true
+			a.emit(Event{Type: "delta", Kind: "think", Step: step, Text: d.Reasoning})
+		}
+		if d.Content != "" {
+			streamed = true
+			a.emit(Event{Type: "delta", Kind: "message", Step: step, Text: d.Content})
+		}
+	})
+	return resp, streamed, err
 }
 
 // RunTurn advances the session by one user message: it records the message,
 // then loops (one tool per step) until the model answers with reply, calls
 // finish, or a limit trips. Session state persists so the next turn continues
 // with full context.
-func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
+func (a *Agent) RunTurn(ctx context.Context, userMsg string, attachments ...Attachment) RunResult {
 	userMsg = strings.TrimSpace(userMsg)
-	a.tx.addUser(userMsg)
-	_ = a.store.RecordEvent(ctx, a.epID, a.step, "(user)", nil, userMsg, false)
 
 	// per-turn reset
 	a.stallStreak = 0
 	a.verifyRejections = 0
+	a.pendingImages = a.prepareAttachments(attachments)
+
+	// Fold an attachment note into the recorded user message so the agent (and
+	// history replay) knows which files are available under ./uploads.
+	recorded := userMsg
+	if note := attachmentNote(attachments); note != "" {
+		recorded = strings.TrimSpace(userMsg + "\n\n" + note)
+	}
+	a.tx.addUser(recorded)
+	_ = a.store.RecordEvent(ctx, a.epID, a.step, "(user)", nil, recorded, false)
 	var lastKey string
 	repeats, errStreak := 0, 0
 	maxSteps := a.cfg.Limits.MaxSteps
@@ -222,8 +375,26 @@ func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
 			Temperature: a.cfg.LLM.Temperature,
 			MaxTokens:   a.cfg.LLM.MaxTokens,
 		}
+		// Attach any pending images to the current (last) user message, once, on
+		// the first step of the turn. Consumed immediately so later steps don't
+		// resend the (large) image payloads.
+		imagesAttached := false
+		if len(a.pendingImages) > 0 {
+			last := len(req.Messages) - 1
+			req.Messages[last].Images = a.pendingImages
+			imagesAttached = true
+			a.pendingImages = nil
+		}
 
-		resp, err := a.llm.Generate(ctx, req)
+		resp, streamed, err := a.generate(ctx, req, step)
+		// Auto-degrade: if a request carrying images failed (e.g. the model has no
+		// vision), retry once as text-only. The images remain available as files.
+		if err != nil && imagesAttached {
+			a.logger.Warn("llm.vision_retry", "step", step, "err", err.Error())
+			a.emit(Event{Type: "info", Step: step, Text: "model could not accept the image; retrying without it (the file is still available to tools)"})
+			req.Messages[len(req.Messages)-1].Images = nil
+			resp, streamed, err = a.generate(ctx, req, step)
+		}
 		if err != nil {
 			a.logger.Warn("llm.error", "step", step, "err", err.Error())
 			a.tx.addResult("LLM call failed: "+err.Error(), true)
@@ -236,8 +407,9 @@ func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
 		}
 
 		// Surface the model's reasoning ("thinking") for this step, when the
-		// provider exposes it, so observers can watch how it decides.
-		if rz := strings.TrimSpace(resp.Reasoning); rz != "" {
+		// provider exposes it, so observers can watch how it decides. When
+		// streaming, the reasoning was already sent live as delta events.
+		if rz := strings.TrimSpace(resp.Reasoning); rz != "" && !streamed {
 			a.emit(Event{Type: "think", Step: step, Text: truncate(rz, maxEventText)})
 		}
 
@@ -247,7 +419,7 @@ func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
 			// For reply, the answer is emitted from the tool result itself, so we
 			// skip the accompanying prose to avoid showing it twice.
 			if tc.Name != "reply" {
-				a.sayMessage(ctx, step, resp.Text)
+				a.sayMessage(ctx, step, resp.Text, streamed)
 			}
 		} else {
 			// Some models (especially via gateways) emit the call as TEXT that
@@ -261,7 +433,7 @@ func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
 			}
 		}
 		if !ok {
-			a.sayMessage(ctx, step, resp.Text)
+			a.sayMessage(ctx, step, resp.Text, streamed)
 			nudge := "No tool was called. You MUST advance by calling exactly one tool (use reply to answer the user directly)."
 			a.logger.Warn("no_tool_call", "step", step, "text", truncate(resp.Text, 160))
 			a.tx.addResult(nudge, true)
@@ -301,12 +473,24 @@ func (a *Agent) RunTurn(ctx context.Context, userMsg string) RunResult {
 		a.tx.addResult(res.Output, res.IsError)
 		_ = a.store.RecordEvent(ctx, epID, step, tc.Name, act.Parameters, res.Output, res.IsError)
 
-		if tc.Name != "finish" && tc.Name != "reply" {
+		if tc.Name != "finish" && tc.Name != "reply" && tc.Name != "set_title" && tc.Name != "send_file" {
 			a.emit(Event{Type: "step", Step: step, Tool: tc.Name, Args: act.Parameters, Output: res.Output, IsError: res.IsError})
+		}
+		if sf := strings.TrimSpace(res.SendFile); sf != "" && !res.IsError {
+			a.emit(Event{Type: "file", Step: step, Args: map[string]any{
+				"name": sf, "image": isImageName(sf), "caption": res.Caption,
+			}})
+			a.logger.Info("session.send_file", "episode", epID, "file", sf)
 		}
 		if res.HasPlan {
 			a.plan = res.Plan
 			a.emit(Event{Type: "plan", Step: step, Plan: res.Plan})
+		}
+		if t := strings.TrimSpace(res.Title); t != "" {
+			_ = a.store.SetEpisodeTitle(ctx, epID, t)
+			a.titleSet = true
+			a.emit(Event{Type: "title", Step: step, Text: t})
+			a.logger.Info("session.title", "episode", epID, "title", t)
 		}
 		if res.IsError {
 			errStreak++
@@ -387,7 +571,7 @@ func (a *Agent) stop(ctx context.Context, epID string, step int, reason, detail 
 // output, is unproductive; a novel successful result resets the streak. Meta
 // tools (update_plan/finish) do not affect it.
 func (a *Agent) updateStall(toolName string, res tool.Result) {
-	if toolName == "update_plan" || toolName == "finish" {
+	if toolName == "update_plan" || toolName == "finish" || toolName == "set_title" || toolName == "send_file" {
 		return
 	}
 	key := strings.TrimSpace(res.Output)

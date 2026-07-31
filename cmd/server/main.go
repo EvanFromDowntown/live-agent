@@ -93,12 +93,6 @@ func run(cfgPath, addr string) error {
 	if err != nil {
 		return err
 	}
-	var embedder llm.Embedder
-	if e, err := llm.NewEmbedder(cfg.Learn.EmbedModel, cfg.LLM.Timeout); err != nil {
-		return err
-	} else if e != nil {
-		embedder = e
-	}
 
 	wsBase := cfg.Agent.Workspace
 	if !filepath.IsAbs(wsBase) {
@@ -111,10 +105,11 @@ func run(cfgPath, addr string) error {
 
 	s := &srv{
 		cfg: cfg, logger: logger, store: st, model: model,
-		embedder: embedder, guard: safety.NewGuard(cfg.Safety), wsBase: wsBase,
+		guard: safety.NewGuard(cfg.Safety), wsBase: wsBase,
 		sessions: map[string]*uiSession{},
 	}
 	s.initSettings()
+	s.rebuildEmbedder() // build the (independent) embedder from settings/env
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -124,6 +119,7 @@ func run(cfgPath, addr string) error {
 	mux.HandleFunc("/episode", s.handleEpisode)
 	mux.HandleFunc("/settings", s.handleSettings)
 	mux.HandleFunc("/models", s.handleModels)
+	mux.HandleFunc("/upload", s.handleUpload)
 
 	logger.Info("server.listen", "addr", addr, "workspace", wsBase, "db", cfg.Agent.DBPath)
 	fmt.Fprintf(os.Stderr, "\n  live-agent web UI:  http://localhost%s\n\n", hostAddr(addr))
@@ -161,6 +157,7 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := strings.TrimSpace(r.URL.Query().Get("session"))
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	srcBase := strings.TrimSpace(r.URL.Query().Get("source"))
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -190,8 +187,8 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Honour the chosen model for this turn (empty = current default).
-	llmModel, err := s.buildLLM(model)
+	// Honour the chosen source + model for this turn (empty = current default).
+	llmModel, err := s.buildLLM(srcBase, model)
 	if err != nil {
 		send(w, flusher, map[string]any{"type": "warn", "text": "model not available: " + err.Error(), "is_error": true})
 		send(w, flusher, map[string]any{"type": "done"})
@@ -209,7 +206,38 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 		send(w, flusher, payload)
 	})
 
-	res := sess.agent.RunTurn(r.Context(), task)
+	// Attachments uploaded (via /upload) for this turn. Names are workspace-
+	// relative (e.g. "uploads/photo.png"). Images are flagged for the model only
+	// when vision is enabled in settings.
+	s.setMu.RLock()
+	vision := s.set.visionOn()
+	s.setMu.RUnlock()
+	var atts []agent.Attachment
+	for _, name := range r.URL.Query()["att"] {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		p := filepath.Clean(filepath.Join(sess.workdir, name))
+		if !strings.HasPrefix(p, filepath.Clean(sess.workdir)+string(os.PathSeparator)) {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		atts = append(atts, agent.Attachment{
+			Name:  name,
+			Path:  p,
+			Mime:  mimeOf(name),
+			Image: vision && isImageExt(name),
+		})
+	}
+
+	res := sess.agent.RunTurn(r.Context(), task, atts...)
+
+	// Ensure the session has an LLM-authored title. The model may set one itself
+	// via set_title; if it did not (e.g. a one-step reply), generate one now.
+	sess.agent.EnsureTitle(r.Context(), res.Summary)
 
 	usedModel := model
 	if usedModel == "" {
@@ -250,7 +278,7 @@ func (s *srv) resolveSession(ctx context.Context, id, task string, emit agent.Em
 	ts := tool.NewToolset()
 	(&tool.Builtins{Workdir: workdir, Timeout: s.cfg.Limits.StepTimeout}).RegisterAll(ts)
 	ag := agent.New(agent.Deps{
-		LLM: s.model, Embedder: s.embedder, Tools: ts, Store: s.store, Guard: s.guard,
+		LLM: s.model, Embedder: s.currentEmbedder(), Tools: ts, Store: s.store, Guard: s.guard,
 		Config: s.cfg, Logger: s.logger, Workdir: workdir,
 		PromptExtension: s.cfg.Agent.SystemPrompt, OnEvent: emit,
 	})
@@ -261,6 +289,9 @@ func (s *srv) resolveSession(ctx context.Context, id, task string, emit agent.Em
 		if meta, err := s.store.EpisodeMeta(ctx, id); err == nil {
 			events, _ := s.store.EpisodeEvents(ctx, id)
 			ag.Rehydrate(ctx, id, meta.Task, events)
+			if strings.TrimSpace(meta.Title) != "" {
+				ag.MarkTitled()
+			}
 			sess := &uiSession{id: id, workdir: workdir, agent: ag}
 			s.sessions[id] = sess
 			return sess, nil
@@ -324,6 +355,18 @@ func (s *srv) handleFile(w http.ResponseWriter, r *http.Request) {
 	data, err := os.ReadFile(full)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	ct := mimeOf(full)
+	download := r.URL.Query().Get("download") == "1"
+	// Images (and explicit downloads) are served raw with their real type; text
+	// is served as UTF-8 and truncated for the in-browser viewer.
+	if isImageExt(full) || download || !strings.HasPrefix(ct, "text/") {
+		if download {
+			w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(full)+"\"")
+		}
+		w.Header().Set("Content-Type", ct)
+		_, _ = w.Write(data)
 		return
 	}
 	const max = 200_000

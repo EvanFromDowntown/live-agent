@@ -33,6 +33,12 @@ type Result struct {
 	// Plan / HasPlan are set by update_plan to replace the pinned plan.
 	Plan    []PlanItem
 	HasPlan bool
+	// Title is set by set_title to (re)name the session/conversation.
+	Title string
+	// SendFile / Caption are set by send_file to surface a workspace file inline
+	// in the chat (images shown inline, other files as a download link).
+	SendFile string
+	Caption  string
 }
 
 // Tool is one executable capability.

@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"liveagent/internal/domain"
@@ -26,6 +31,9 @@ type Builtins struct {
 	Timeout   time.Duration
 	PythonBin string // resolved python interpreter ("python3"/"python")
 	http      *http.Client
+
+	svcMu    sync.Mutex
+	services map[string]*bgService // long-running background processes started this session
 }
 
 // RegisterAll registers every built-in tool into the toolset.
@@ -41,8 +49,17 @@ func (b *Builtins) RegisterAll(ts *Toolset) {
 	ts.Register(&pythonTool{b})
 	ts.Register(&readFileTool{b})
 	ts.Register(&writeFileTool{b})
+	ts.Register(&editFileTool{b})
+	ts.Register(&listDirTool{b})
+	ts.Register(&globTool{b})
+	ts.Register(&grepTool{b})
 	ts.Register(&httpFetchTool{b})
+	ts.Register(&startServiceTool{b})
+	ts.Register(&listServicesTool{b})
+	ts.Register(&stopServiceTool{b})
 	ts.Register(&replyTool{})
+	ts.Register(&setTitleTool{})
+	ts.Register(&sendFileTool{b})
 	ts.Register(&updatePlanTool{})
 	ts.Register(&finishTool{})
 }
@@ -97,6 +114,102 @@ func (b *Builtins) resolve(p string) string {
 func str(args map[string]any, key string) string {
 	s, _ := args[key].(string)
 	return s
+}
+
+func strOr(args map[string]any, key, def string) string {
+	if s, ok := args[key].(string); ok && strings.TrimSpace(s) != "" {
+		return s
+	}
+	return def
+}
+
+// intArg reads an integer argument. JSON numbers decode to float64.
+func intArg(args map[string]any, key string, def int) int {
+	switch n := args[key].(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return def
+}
+
+// isSkippedDir reports directories we never descend into for glob/grep/list, to
+// avoid drowning results in dependency and VCS noise.
+func isSkippedDir(name string) bool {
+	switch name {
+	case ".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".mypy_cache", ".pytest_cache", "dist", "build", ".next":
+		return true
+	}
+	return false
+}
+
+// isBinary heuristically detects binary content (a NUL byte in the first 8 KiB).
+func isBinary(data []byte) bool {
+	n := len(data)
+	if n > 8192 {
+		n = 8192
+	}
+	for i := 0; i < n; i++ {
+		if data[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// globToRegexp compiles a shell-style glob into an anchored RE2 regexp.
+// Supported: '*' (any run within a segment), '**' (any depth; '**/' also matches
+// zero directories), '?' (one non-separator char). Paths use forward slashes.
+func globToRegexp(glob string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(glob); i++ {
+		c := glob[i]
+		switch c {
+		case '*':
+			if i+1 < len(glob) && glob[i+1] == '*' {
+				i++ // consume second '*'
+				if i+1 < len(glob) && glob[i+1] == '/' {
+					i++ // consume '/'
+					b.WriteString("(?:.*/)?")
+				} else {
+					b.WriteString(".*")
+				}
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case '?':
+			b.WriteString("[^/]")
+		case '.', '(', ')', '+', '|', '^', '$', '{', '}', '[', ']', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
 }
 
 // -----------------------------------------------------------------------------
@@ -202,6 +315,329 @@ func (t *writeFileTool) Execute(_ context.Context, args map[string]any) Result {
 }
 
 // -----------------------------------------------------------------------------
+// edit_file — surgical, exact-string replacement (cheaper & safer than a full
+// rewrite for large files).
+// -----------------------------------------------------------------------------
+
+type editFileTool struct{ b *Builtins }
+
+func (t *editFileTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "edit_file",
+		Description: "Replace an exact substring in an existing text file. By default old_string must occur EXACTLY ONCE " +
+			"(include enough surrounding context to make it unique); set replace_all=true to replace every occurrence. " +
+			"Prefer this over write_file for edits to large files. Use write_file to create a new file.",
+		Parameters: map[string]domain.ParamSpec{
+			"path":        {Type: "string", Required: true, Description: "File to edit (relative to the working directory)."},
+			"old_string":  {Type: "string", Required: true, Description: "Exact text to find, including surrounding context for uniqueness."},
+			"new_string":  {Type: "string", Required: true, Description: "Replacement text."},
+			"replace_all": {Type: "bool", Required: false, Description: "Replace every occurrence instead of requiring a unique match."},
+		},
+	}
+}
+
+func (t *editFileTool) Execute(_ context.Context, args map[string]any) Result {
+	p := t.b.resolve(str(args, "path"))
+	oldS := str(args, "old_string")
+	newS := str(args, "new_string")
+	replaceAll, _ := args["replace_all"].(bool)
+	if oldS == "" {
+		return Result{IsError: true, Output: "old_string is empty; use write_file to create or fully overwrite a file"}
+	}
+	if oldS == newS {
+		return Result{IsError: true, Output: "old_string and new_string are identical; nothing to do"}
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return Result{IsError: true, Output: "read failed: " + err.Error()}
+	}
+	content := string(data)
+	n := strings.Count(content, oldS)
+	if n == 0 {
+		return Result{IsError: true, Output: "old_string not found in " + p + " (it must match exactly, including whitespace)"}
+	}
+	if n > 1 && !replaceAll {
+		return Result{IsError: true, Output: fmt.Sprintf("old_string is not unique: found %d occurrences in %s. Add more surrounding context, or set replace_all=true.", n, p)}
+	}
+	var updated string
+	if replaceAll {
+		updated = strings.ReplaceAll(content, oldS, newS)
+	} else {
+		updated = strings.Replace(content, oldS, newS, 1)
+	}
+	if err := os.WriteFile(p, []byte(updated), 0o644); err != nil {
+		return Result{IsError: true, Output: "write failed: " + err.Error()}
+	}
+	return Result{Output: fmt.Sprintf("edited %s (%d replacement(s))", p, n)}
+}
+
+// -----------------------------------------------------------------------------
+// list_dir — structured directory listing (optionally recursive).
+// -----------------------------------------------------------------------------
+
+type listDirTool struct{ b *Builtins }
+
+func (t *listDirTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "list_dir",
+		Description: "List directory entries (relative paths resolve against the working directory). " +
+			"Directories end with '/'. Set depth>1 to recurse. Use this to explore the file tree instead of shelling out to ls.",
+		Parameters: map[string]domain.ParamSpec{
+			"path":  {Type: "string", Required: false, Description: "Directory to list (default: working directory)."},
+			"depth": {Type: "int", Required: false, Description: "Recursion depth (default 1, max 5)."},
+		},
+	}
+}
+
+func (t *listDirTool) Execute(_ context.Context, args map[string]any) Result {
+	root := t.b.resolve(strOr(args, "path", "."))
+	depth := intArg(args, "depth", 1)
+	if depth < 1 {
+		depth = 1
+	}
+	if depth > 5 {
+		depth = 5
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return Result{IsError: true, Output: "list failed: " + err.Error()}
+	}
+	if !info.IsDir() {
+		return Result{IsError: true, Output: root + " is not a directory"}
+	}
+
+	const maxEntries = 500
+	var lines []string
+	truncated := false
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if p == root {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if isSkippedDir(d.Name()) {
+				return fs.SkipDir
+			}
+			if strings.Count(rel, "/")+1 >= depth {
+				lines = append(lines, rel+"/")
+				return fs.SkipDir
+			}
+			lines = append(lines, rel+"/")
+			return nil
+		}
+		size := int64(0)
+		if fi, e := d.Info(); e == nil {
+			size = fi.Size()
+		}
+		lines = append(lines, fmt.Sprintf("%s  (%s)", rel, humanSize(size)))
+		if len(lines) >= maxEntries {
+			truncated = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return Result{IsError: true, Output: "list failed: " + err.Error()}
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return Result{Output: "(empty directory)"}
+	}
+	out := strings.Join(lines, "\n")
+	if truncated {
+		out += fmt.Sprintf("\n...[truncated at %d entries]", maxEntries)
+	}
+	return Result{Output: clip(out)}
+}
+
+// -----------------------------------------------------------------------------
+// glob — find files by name pattern (supports ** for any depth).
+// -----------------------------------------------------------------------------
+
+type globTool struct{ b *Builtins }
+
+func (t *globTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "glob",
+		Description: "Find files whose path matches a glob pattern. Supports '*' (within a path segment), '**' (any depth) " +
+			"and '?'. Examples: '**/*.go', 'src/**/*.ts', '*.md'. Returns matching relative paths.",
+		Parameters: map[string]domain.ParamSpec{
+			"pattern": {Type: "string", Required: true, Description: "Glob pattern to match against relative paths."},
+			"path":    {Type: "string", Required: false, Description: "Root directory to search under (default: working directory)."},
+		},
+	}
+}
+
+func (t *globTool) Execute(_ context.Context, args map[string]any) Result {
+	pattern := strings.TrimSpace(str(args, "pattern"))
+	if pattern == "" {
+		return Result{IsError: true, Output: "pattern is empty"}
+	}
+	re, err := globToRegexp(pattern)
+	if err != nil {
+		return Result{IsError: true, Output: "bad pattern: " + err.Error()}
+	}
+	root := t.b.resolve(strOr(args, "path", "."))
+	baseOnly := !strings.Contains(pattern, "/")
+
+	const maxMatches = 300
+	var matches []string
+	truncated := false
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && isSkippedDir(d.Name()) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		if re.MatchString(rel) || (baseOnly && re.MatchString(path.Base(rel))) {
+			matches = append(matches, rel)
+			if len(matches) >= maxMatches {
+				truncated = true
+				return fs.SkipAll
+			}
+		}
+		return nil
+	})
+	if len(matches) == 0 {
+		return Result{Output: "no files match " + pattern}
+	}
+	sort.Strings(matches)
+	out := strings.Join(matches, "\n")
+	if truncated {
+		out += fmt.Sprintf("\n...[truncated at %d matches]", maxMatches)
+	}
+	return Result{Output: clip(out)}
+}
+
+// -----------------------------------------------------------------------------
+// grep — search file contents by regex.
+// -----------------------------------------------------------------------------
+
+type grepTool struct{ b *Builtins }
+
+func (t *grepTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "grep",
+		Description: "Search file contents for a regular expression (Go/RE2 syntax) and return matching lines as " +
+			"'path:line: text'. Optionally restrict to a subtree with 'path' and to filenames with an 'include' glob.",
+		Parameters: map[string]domain.ParamSpec{
+			"pattern":     {Type: "string", Required: true, Description: "Regular expression to search for."},
+			"path":        {Type: "string", Required: false, Description: "File or directory to search under (default: working directory)."},
+			"include":     {Type: "string", Required: false, Description: "Glob to filter filenames, e.g. '*.go' or '**/*.py'."},
+			"ignore_case": {Type: "bool", Required: false, Description: "Case-insensitive match (default false)."},
+		},
+	}
+}
+
+func (t *grepTool) Execute(_ context.Context, args map[string]any) Result {
+	pattern := str(args, "pattern")
+	if strings.TrimSpace(pattern) == "" {
+		return Result{IsError: true, Output: "pattern is empty"}
+	}
+	if ic, _ := args["ignore_case"].(bool); ic {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return Result{IsError: true, Output: "bad regexp: " + err.Error()}
+	}
+	var incRe *regexp.Regexp
+	if inc := strings.TrimSpace(str(args, "include")); inc != "" {
+		if incRe, err = globToRegexp(inc); err != nil {
+			return Result{IsError: true, Output: "bad include glob: " + err.Error()}
+		}
+	}
+	root := t.b.resolve(strOr(args, "path", "."))
+	includeBaseOnly := incRe != nil && !strings.Contains(str(args, "include"), "/")
+
+	const (
+		maxHits    = 200
+		maxPerFile = 20
+		maxFileSz  = 2 << 20 // 2 MiB
+	)
+	var hits []string
+	truncated := false
+
+	visit := func(p string) {
+		fi, e := os.Stat(p)
+		if e != nil || fi.IsDir() || fi.Size() > maxFileSz {
+			return
+		}
+		rel, _ := filepath.Rel(t.b.Workdir, p)
+		rel = filepath.ToSlash(rel)
+		if incRe != nil {
+			relToRoot, _ := filepath.Rel(root, p)
+			relToRoot = filepath.ToSlash(relToRoot)
+			if !incRe.MatchString(relToRoot) && !(includeBaseOnly && incRe.MatchString(path.Base(p))) {
+				return
+			}
+		}
+		data, e := os.ReadFile(p)
+		if e != nil || isBinary(data) {
+			return
+		}
+		perFile := 0
+		for i, line := range strings.Split(string(data), "\n") {
+			if re.MatchString(line) {
+				hits = append(hits, fmt.Sprintf("%s:%d: %s", rel, i+1, strings.TrimRight(truncate(line, 300), "\r")))
+				if perFile++; perFile >= maxPerFile {
+					hits = append(hits, fmt.Sprintf("%s: ...[more matches in this file omitted]", rel))
+					break
+				}
+				if len(hits) >= maxHits {
+					truncated = true
+					break
+				}
+			}
+		}
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		return Result{IsError: true, Output: "grep failed: " + err.Error()}
+	}
+	if info.IsDir() {
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+			if werr != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if p != root && isSkippedDir(d.Name()) {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if len(hits) >= maxHits {
+				truncated = true
+				return fs.SkipAll
+			}
+			visit(p)
+			return nil
+		})
+	} else {
+		visit(root)
+	}
+	if len(hits) == 0 {
+		return Result{Output: "no matches for /" + str(args, "pattern") + "/"}
+	}
+	out := strings.Join(hits, "\n")
+	if truncated {
+		out += fmt.Sprintf("\n...[truncated at %d matches]", maxHits)
+	}
+	return Result{Output: clip(out)}
+}
+
+// -----------------------------------------------------------------------------
 // http_fetch
 // -----------------------------------------------------------------------------
 
@@ -264,6 +700,74 @@ func (t *replyTool) Execute(_ context.Context, args map[string]any) Result {
 		return Result{IsError: true, Output: "text is empty"}
 	}
 	return Result{Reply: true, Output: text}
+}
+
+// -----------------------------------------------------------------------------
+// set_title — name the conversation
+// -----------------------------------------------------------------------------
+
+type setTitleTool struct{}
+
+func (t *setTitleTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "set_title",
+		Description: "Give THIS conversation a short, human-friendly title (a few words, <=8) that summarises its topic. " +
+			"Call this once, early, for a new conversation so it is easy to find later. This is metadata only — it does " +
+			"not answer the user or complete the task, so still use reply or the action tools afterwards.",
+		Parameters: map[string]domain.ParamSpec{
+			"title": {Type: "string", Required: true, Description: "A concise title, ideally <=8 words, no surrounding quotes."},
+		},
+	}
+}
+
+func (t *setTitleTool) Execute(_ context.Context, args map[string]any) Result {
+	title := strings.TrimSpace(str(args, "title"))
+	title = strings.Trim(title, "\"'")
+	if title == "" {
+		return Result{IsError: true, Output: "title is empty"}
+	}
+	if len(title) > 120 {
+		title = title[:120]
+	}
+	return Result{Title: title, Output: "title set: " + title}
+}
+
+type sendFileTool struct{ b *Builtins }
+
+func (t *sendFileTool) Spec() domain.ActionSchema {
+	return domain.ActionSchema{
+		Name: "send_file",
+		Description: "Send a file from the working directory to the user so it shows up inline in the chat " +
+			"(images are displayed; other files get a download link). Use this to deliver results such as " +
+			"generated images, reports, or data files. The file must already exist in the working directory.",
+		Parameters: map[string]domain.ParamSpec{
+			"path":    {Type: "string", Required: true, Description: "Path of the file to send (relative to the working directory)."},
+			"caption": {Type: "string", Required: false, Description: "Optional short caption to show with the file."},
+		},
+	}
+}
+
+func (t *sendFileTool) Execute(_ context.Context, args map[string]any) Result {
+	raw := strings.TrimSpace(str(args, "path"))
+	if raw == "" {
+		return Result{IsError: true, Output: "path is empty"}
+	}
+	full := t.b.resolve(raw)
+	info, err := os.Stat(full)
+	if err != nil {
+		return Result{IsError: true, Output: "file not found: " + raw}
+	}
+	if info.IsDir() {
+		return Result{IsError: true, Output: raw + " is a directory, not a file"}
+	}
+	// Constrain to the working directory and report a workspace-relative path.
+	rel, err := filepath.Rel(t.b.Workdir, full)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return Result{IsError: true, Output: "file must be inside the working directory"}
+	}
+	rel = filepath.ToSlash(rel)
+	caption := strings.TrimSpace(str(args, "caption"))
+	return Result{SendFile: rel, Caption: caption, Output: "sent to user: " + rel}
 }
 
 // -----------------------------------------------------------------------------

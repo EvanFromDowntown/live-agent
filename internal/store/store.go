@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     ended_at   TEXT,
     steps      INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'running',
-    summary    TEXT
+    summary    TEXT,
+    title      TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +63,7 @@ var migrations = []string{
 	`ALTER TABLE notes ADD COLUMN wins INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE notes ADD COLUMN last_used_at TEXT`,
 	`ALTER TABLE notes ADD COLUMN embedding TEXT`, // JSON array of float32 for semantic recall
+	`ALTER TABLE episodes ADD COLUMN title TEXT`,  // LLM-authored session title
 }
 
 // Open opens (creating if needed) the SQLite database and applies the schema.
@@ -159,10 +161,20 @@ func (s *Store) EndEpisode(ctx context.Context, episodeID, status, summary strin
 type EpisodeRow struct {
 	ID        string `json:"id"`
 	Task      string `json:"task"`
+	Title     string `json:"title"`
 	Status    string `json:"status"`
 	Steps     int    `json:"steps"`
 	StartedAt string `json:"started_at"`
 	Summary   string `json:"summary"`
+}
+
+// SetEpisodeTitle sets a short, human-friendly title for an episode/session.
+func (s *Store) SetEpisodeTitle(ctx context.Context, id, title string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE episodes SET title=? WHERE id=?`, title, id)
+	if err != nil {
+		return fmt.Errorf("store: set title: %w", err)
+	}
+	return nil
 }
 
 // ListEpisodes returns recent episodes for an agent, newest first.
@@ -171,7 +183,7 @@ func (s *Store) ListEpisodes(ctx context.Context, agent string, limit int) ([]Ep
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, task, status, steps, started_at, COALESCE(summary,'')
+		`SELECT id, task, COALESCE(title,''), status, steps, started_at, COALESCE(summary,'')
 		   FROM episodes WHERE agent=? ORDER BY started_at DESC LIMIT ?`, agent, limit)
 	if err != nil {
 		return nil, err
@@ -180,7 +192,7 @@ func (s *Store) ListEpisodes(ctx context.Context, agent string, limit int) ([]Ep
 	var out []EpisodeRow
 	for rows.Next() {
 		var e EpisodeRow
-		if err := rows.Scan(&e.ID, &e.Task, &e.Status, &e.Steps, &e.StartedAt, &e.Summary); err != nil {
+		if err := rows.Scan(&e.ID, &e.Task, &e.Title, &e.Status, &e.Steps, &e.StartedAt, &e.Summary); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -223,9 +235,9 @@ func (s *Store) EpisodeEvents(ctx context.Context, episodeID string) ([]EventRow
 func (s *Store) EpisodeMeta(ctx context.Context, id string) (EpisodeRow, error) {
 	var e EpisodeRow
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, task, status, steps, started_at, COALESCE(summary,'')
+		`SELECT id, task, COALESCE(title,''), status, steps, started_at, COALESCE(summary,'')
 		   FROM episodes WHERE id=?`, id).
-		Scan(&e.ID, &e.Task, &e.Status, &e.Steps, &e.StartedAt, &e.Summary)
+		Scan(&e.ID, &e.Task, &e.Title, &e.Status, &e.Steps, &e.StartedAt, &e.Summary)
 	return e, err
 }
 

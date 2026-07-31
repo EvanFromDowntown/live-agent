@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ type OpenAIProvider struct {
 	apiKey                string
 	model                 string
 	client                *http.Client
+	streamClient          *http.Client // no overall timeout; streaming is bounded by context
 	disableResponseFormat bool
 	disableThinking       bool
 	reasoningEffort       string
@@ -74,15 +77,28 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 		apiKey:                key,
 		model:                 model,
 		client:                &http.Client{Timeout: timeout},
+		streamClient:          &http.Client{}, // bounded by ctx, not a fixed deadline
 		disableResponseFormat: cfg.DisableResponseFormat,
 		disableThinking:       cfg.DisableThinking,
 		reasoningEffort:       cfg.ReasoningEffort,
 	}, nil
 }
 
+// chatMessage.Content is either a plain string or a []contentPart (used for
+// multimodal messages that carry images), so it is typed as any.
 type chatMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+type contentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *imageURLPart `json:"image_url,omitempty"`
+}
+
+type imageURLPart struct {
+	URL string `json:"url"`
 }
 
 type toolFunctionDef struct {
@@ -106,6 +122,12 @@ type chatRequest struct {
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
 	Thinking        *thinkingParam  `json:"thinking,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	StreamOptions   *streamOptions  `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type responseFormat struct {
@@ -140,10 +162,21 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
-// Generate implements domain.LLM.
-func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (domain.LLMResponse, error) {
+// buildRequest assembles the wire request shared by Generate and GenerateStream.
+func (p *OpenAIProvider) buildRequest(req domain.LLMRequest, stream bool) chatRequest {
 	msgs := make([]chatMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
+		if len(m.Images) > 0 {
+			parts := make([]contentPart, 0, len(m.Images)+1)
+			if strings.TrimSpace(m.Content) != "" {
+				parts = append(parts, contentPart{Type: "text", Text: m.Content})
+			}
+			for _, img := range m.Images {
+				parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURLPart{URL: img}})
+			}
+			msgs = append(msgs, chatMessage{Role: m.Role, Content: parts})
+			continue
+		}
 		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
 	}
 	body := chatRequest{
@@ -175,18 +208,33 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	if p.reasoningEffort != "" {
 		body.ReasoningEffort = p.reasoningEffort
 	}
+	if stream {
+		body.Stream = true
+		body.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	return body
+}
+
+func (p *OpenAIProvider) newHTTPRequest(ctx context.Context, body chatRequest) (*http.Request, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return domain.LLMResponse{}, err
+		return nil, err
 	}
-
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return domain.LLMResponse{}, err
+		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	return httpReq, nil
+}
 
+// Generate implements domain.LLM.
+func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (domain.LLMResponse, error) {
+	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, false))
+	if err != nil {
+		return domain.LLMResponse{}, err
+	}
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
 		return domain.LLMResponse{}, fmt.Errorf("llm: request failed: %w", err)
@@ -213,6 +261,126 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 		out.ToolCalls = append(out.ToolCalls, domain.ToolCall{
 			ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
 		})
+	}
+	return out, nil
+}
+
+// streamChunk is one server-sent event during streaming.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+			ToolCalls        []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage *struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// GenerateStream implements domain.StreamingLLM using OpenAI SSE streaming.
+func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMRequest, onDelta func(domain.StreamDelta)) (domain.LLMResponse, error) {
+	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, true))
+	if err != nil {
+		return domain.LLMResponse{}, err
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+	resp, err := p.streamClient.Do(httpReq)
+	if err != nil {
+		return domain.LLMResponse{}, fmt.Errorf("llm: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return domain.LLMResponse{}, fmt.Errorf("llm: status %d: %s", resp.StatusCode, truncate(string(data), 300))
+	}
+
+	var content, reasoning strings.Builder
+	type accTool struct {
+		id, name string
+		args     strings.Builder
+	}
+	tools := map[int]*accTool{}
+	var order []int
+	tokens := 0
+
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			line = strings.TrimRight(line, "\r\n")
+			if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimSpace(line[len("data:"):])
+				if payload == "[DONE]" {
+					break
+				}
+				var chunk streamChunk
+				if json.Unmarshal([]byte(payload), &chunk) != nil {
+					// tolerate partial/keepalive frames
+				} else {
+					if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+						tokens = chunk.Usage.TotalTokens
+					}
+					for _, ch := range chunk.Choices {
+						d := ch.Delta
+						rz := d.ReasoningContent
+						if rz == "" {
+							rz = d.Reasoning
+						}
+						if rz != "" {
+							reasoning.WriteString(rz)
+							onDelta(domain.StreamDelta{Reasoning: rz})
+						}
+						if d.Content != "" {
+							content.WriteString(d.Content)
+							onDelta(domain.StreamDelta{Content: d.Content})
+						}
+						for _, tc := range d.ToolCalls {
+							at := tools[tc.Index]
+							if at == nil {
+								at = &accTool{}
+								tools[tc.Index] = at
+								order = append(order, tc.Index)
+							}
+							if tc.ID != "" {
+								at.id = tc.ID
+							}
+							if tc.Function.Name != "" {
+								at.name = tc.Function.Name
+							}
+							if tc.Function.Arguments != "" {
+								at.args.WriteString(tc.Function.Arguments)
+							}
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return domain.LLMResponse{}, fmt.Errorf("llm: stream read: %w", err)
+		}
+	}
+
+	out := domain.LLMResponse{Text: content.String(), Reasoning: reasoning.String(), TokensUsed: tokens}
+	sort.Ints(order)
+	for _, idx := range order {
+		at := tools[idx]
+		if at.name == "" {
+			continue
+		}
+		out.ToolCalls = append(out.ToolCalls, domain.ToolCall{ID: at.id, Name: at.name, Arguments: at.args.String()})
 	}
 	return out, nil
 }

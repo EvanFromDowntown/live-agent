@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"liveagent/internal/tool"
 )
@@ -17,8 +18,13 @@ user AND complete real software and office tasks by taking actions on the machin
 you run on. The specifics of that environment (operating system, shell, available
 interpreters, working directory, network access) are provided at runtime in the
 context block below — read them and adapt. Do NOT assume a particular operating
-system. You act by calling EXACTLY ONE tool per step, then see its real result and
-decide the next step.
+system. Each step you call one or more tools, then see their real results and
+decide the next step. Emit MULTIPLE tool calls at once ONLY when they are
+independent read-only lookups (read_file, list_dir, glob, grep, http_fetch) —
+they run in parallel and this is faster (e.g. read three files in one step).
+Anything that changes state (write_file, edit_file, run_shell, run_python,
+services) or ends the turn (finish, reply) should be its own single call so you
+can observe each result before deciding what to do next.
 
 Choosing a mode (decide this yourself, every user message):
 - If the message needs NO work on the machine — a greeting, a question you can
@@ -102,9 +108,16 @@ func (a *Agent) systemPrompt() string {
 // plus a machine-readable context block (task/goal, probed environment, and the
 // pinned plan). Rebuilt every step so these are always fresh and never compacted.
 func (a *Agent) buildAsk() string {
+	// The objective is the CURRENT turn's request, not the session's opening
+	// message — otherwise a long multi-task conversation keeps re-injecting the
+	// first task and drifts back to redoing it.
+	current := strings.TrimSpace(a.turnTask)
+	if current == "" {
+		current = a.task
+	}
 	block := map[string]any{
-		"task":        a.task,
-		"environment": a.env,
+		"current_request": current,
+		"environment":     a.env,
 	}
 	if len(a.plan) > 0 {
 		block["plan"] = a.plan
@@ -115,9 +128,10 @@ func (a *Agent) buildAsk() string {
 		block["lessons_from_past_runs"] = a.lessons
 	}
 	b, _ := json.MarshalIndent(block, "", "  ")
-	ask := "Respond to the latest USER message in the conversation above by calling exactly one tool. " +
+	ask := "Respond to the latest USER message in the conversation above by calling a tool. " +
 		"If it needs no work on the machine, answer directly with the reply tool. " +
-		"Otherwise take the next single action toward it, advance the plan, correct any error shown above, " +
+		"Otherwise take the next action toward it (you may batch several independent read-only lookups in one step; " +
+		"keep state-changing or turn-ending calls separate), advance the plan, correct any error shown above, " +
 		"and call finish when its success criteria are met.\n\nCONTEXT:\n" + string(b)
 	if a.cfg != nil && a.cfg.Limits.StallNudge > 0 && a.stallStreak >= a.cfg.Limits.StallNudge {
 		ask += fmt.Sprintf("\n\nWARNING: the last %d steps made no new progress (errors or repeated output). "+

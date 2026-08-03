@@ -26,6 +26,14 @@ type Event struct {
 	Text       string          `json:"text,omitempty"`
 	Lessons    int             `json:"lessons,omitempty"`
 	OS         string          `json:"os,omitempty"`
+
+	// Usage / cost telemetry, carried on "usage" events (cumulative for the turn)
+	// and on terminal events (finish/reply/stop) so the UI can show totals.
+	PromptTokens     int   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int   `json:"completion_tokens,omitempty"`
+	TotalTokens      int   `json:"total_tokens,omitempty"`
+	LLMCalls         int   `json:"llm_calls,omitempty"`
+	ElapsedMS        int64 `json:"elapsed_ms,omitempty"`
 }
 
 // Emitter receives run events. It must be safe to call from the run goroutine

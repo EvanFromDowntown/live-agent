@@ -47,6 +47,7 @@ type uiSession struct {
 	id      string
 	workdir string
 	agent   *agent.Agent
+	mu      sync.Mutex // serialises turns WITHIN this conversation (different sessions run concurrently)
 }
 
 // srv holds the shared, run-independent collaborators.
@@ -59,7 +60,7 @@ type srv struct {
 	guard    *safety.Guard
 	wsBase   string
 
-	mu       sync.Mutex            // serialises turns (shared store + one turn at a time)
+	sessMu   sync.Mutex            // guards the sessions map (session creation/lookup)
 	sessions map[string]*uiSession // live conversations, keyed by session id
 
 	setMu        sync.RWMutex  // guards set
@@ -120,6 +121,8 @@ func run(cfgPath, addr string) error {
 	mux.HandleFunc("/settings", s.handleSettings)
 	mux.HandleFunc("/models", s.handleModels)
 	mux.HandleFunc("/upload", s.handleUpload)
+	mux.HandleFunc("/embed/test", s.handleEmbedTest)
+	mux.HandleFunc("/services", s.handleServices)
 
 	logger.Info("server.listen", "addr", addr, "workspace", wsBase, "db", cfg.Agent.DBPath)
 	fmt.Fprintf(os.Stderr, "\n  live-agent web UI:  http://localhost%s\n\n", hostAddr(addr))
@@ -167,14 +170,6 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// One turn at a time (shared store + serialised mutable session state).
-	if !s.mu.TryLock() {
-		send(w, flusher, map[string]any{"type": "busy", "text": "another turn is in progress; try again shortly"})
-		send(w, flusher, map[string]any{"type": "done"})
-		return
-	}
-	defer s.mu.Unlock()
-
 	sess, err := s.resolveSession(r.Context(), sessionID, task, func(e agent.Event) {
 		payload := map[string]any{}
 		b, _ := json.Marshal(e)
@@ -186,6 +181,14 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 		send(w, flusher, map[string]any{"type": "done"})
 		return
 	}
+
+	// One turn at a time WITHIN a conversation; different sessions run concurrently.
+	if !sess.mu.TryLock() {
+		send(w, flusher, map[string]any{"type": "busy", "text": "this conversation already has a turn running; try again shortly"})
+		send(w, flusher, map[string]any{"type": "done"})
+		return
+	}
+	defer sess.mu.Unlock()
 
 	// Honour the chosen source + model for this turn (empty = current default).
 	llmModel, err := s.buildLLM(srcBase, model)
@@ -250,7 +253,12 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 		"episode": res.EpisodeID, "steps": res.Steps,
 		"finished": res.Finished, "success": res.Success, "verified": res.Verified,
 		"reply": res.Reply, "stop_reason": res.StopReason, "summary": res.Summary,
-		"files": listFiles(sess.workdir),
+		"files":             listFiles(sess.workdir),
+		"prompt_tokens":     res.PromptTokens,
+		"completion_tokens": res.CompletionTokens,
+		"total_tokens":      res.TotalTokens,
+		"llm_calls":         res.LLMCalls,
+		"elapsed_ms":        res.ElapsedMS,
 	})
 	send(w, flusher, map[string]any{"type": "done"})
 }
@@ -260,6 +268,8 @@ func (s *srv) handleStream(w http.ResponseWriter, r *http.Request) {
 // is bound only for the initial start/rehydrate events; handleStream rebinds it
 // for the turn itself.
 func (s *srv) resolveSession(ctx context.Context, id, task string, emit agent.Emitter) (*uiSession, error) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
 	if id != "" {
 		if sess, ok := s.sessions[id]; ok {
 			return sess, nil
@@ -303,6 +313,37 @@ func (s *srv) resolveSession(ctx context.Context, id, task string, emit agent.Em
 	sess := &uiSession{id: newID, workdir: workdir, agent: ag}
 	s.sessions[newID] = sess
 	return sess, nil
+}
+
+// handleServices lists (GET) or stops (POST) the background services of a
+// session, reading persisted descriptors from its workspace so it works even
+// after a restart. Query param: session=<id>; POST also takes name=<service>.
+func (s *srv) handleServices(w http.ResponseWriter, r *http.Request) {
+	session := strings.TrimSpace(r.URL.Query().Get("session"))
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	workdir := filepath.Join(s.wsBase, session)
+	// Guard against path escapes via a crafted session id.
+	if !strings.HasPrefix(filepath.Clean(workdir)+string(os.PathSeparator), filepath.Clean(s.wsBase)+string(os.PathSeparator)) {
+		http.Error(w, "bad session", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{"services": tool.ListServices(workdir)})
+	case http.MethodPost:
+		name := strings.TrimSpace(r.URL.Query().Get("name"))
+		msg, err := tool.StopService(workdir, name)
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "message": msg, "services": tool.ListServices(workdir)})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // handleEpisodes lists recent runs (sessions) for the sidebar.

@@ -38,7 +38,11 @@ func (a *Agent) verifyFinish(ctx context.Context, summary string) (verified, dec
 		"threshold (count/length/format), it is NOT met. Respond with ONLY a JSON object: " +
 		`{"verified": true|false, "reason": "<one concise sentence>"}.`
 
-	user := "TASK:\n" + a.task +
+	task := strings.TrimSpace(a.turnTask)
+	if task == "" {
+		task = a.task
+	}
+	user := "TASK:\n" + task +
 		"\n\nAGENT FINISH SUMMARY:\n" + summary +
 		"\n\nWORKSPACE FILES:\n" + a.listWorkspace() +
 		"\n\nPRODUCED FILE CONTENTS:\n" + a.readArtifacts() +
@@ -53,6 +57,7 @@ func (a *Agent) verifyFinish(ctx context.Context, summary string) (verified, dec
 	if err != nil {
 		return true, false, "verifier unavailable: " + err.Error()
 	}
+	a.addUsage(a.step, resp)
 	obj, err := llm.ExtractJSONObject(resp.Text)
 	if err != nil {
 		return true, false, "verifier output unparseable"

@@ -88,6 +88,26 @@ const indexHTML = `<!doctype html>
         box-shadow:0 0 18px rgba(255,42,109,.35),0 0 12px rgba(5,217,232,.25)}
   .assist{align-self:flex-start;max-width:88%;display:flex;flex-direction:column;gap:10px;width:100%}
   .msg{background:rgba(13,16,34,.7);border:1px solid var(--line);border-left:2px solid var(--accent);border-radius:4px 12px 12px 4px;padding:10px 14px;white-space:pre-wrap;word-break:break-word}
+  /* markdown-rendered prose: block layout instead of raw pre-wrap */
+  .msg.md{white-space:normal}
+  .msg.md>*:first-child{margin-top:0} .msg.md>*:last-child{margin-bottom:0}
+  .msg.md p{margin:8px 0;word-break:break-word}
+  .msg.md h1,.msg.md h2,.msg.md h3,.msg.md h4,.msg.md h5,.msg.md h6{font-family:var(--disp);color:#eaf3ff;margin:12px 0 6px;line-height:1.25}
+  .msg.md .mh1{font-size:19px} .msg.md .mh2{font-size:17px} .msg.md .mh3{font-size:15px} .msg.md .mh4,.msg.md .mh5,.msg.md .mh6{font-size:13.5px}
+  .msg.md ul,.msg.md ol{margin:6px 0;padding-left:22px} .msg.md li{margin:3px 0}
+  .msg.md blockquote{margin:8px 0;padding:2px 12px;border-left:3px solid var(--purple);color:#c3b8e6;background:rgba(185,103,255,.06)}
+  .msg.md a{color:var(--accent);text-decoration:none} .msg.md a:hover{text-shadow:var(--glow)}
+  .msg.md code{font-family:var(--mono);font-size:12.5px;background:rgba(5,217,232,.1);border:1px solid rgba(5,217,232,.22);border-radius:4px;padding:1px 5px;color:#9fe8ee}
+  .msg.md .codeblock{position:relative;margin:10px 0;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--term)}
+  .msg.md .codeblock pre{margin:0;padding:12px 14px;overflow:auto;max-height:360px}
+  .msg.md .codeblock code{display:block;background:none;border:0;padding:0;color:#cbd3e6;white-space:pre;font-size:12.5px}
+  .msg.md .codeblock .copy{position:absolute;top:6px;right:6px;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+    background:rgba(20,24,52,.85);color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:3px 8px;cursor:pointer;opacity:0;transition:.12s}
+  .msg.md .codeblock:hover .copy{opacity:1} .msg.md .codeblock .copy:hover{border-color:var(--accent);color:var(--accent)}
+  /* live streaming stdout while a shell/python command runs */
+  details.tool.live>summary .cmd{color:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
+  pre.liveout{margin:0;padding:10px 12px;background:var(--term);white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12.5px;max-height:280px;overflow:auto;color:#9fe8ee}
   /* thinking + prose are always shown expanded — never hidden behind a toggle */
   .think{background:rgba(185,103,255,.06);border:1px solid rgba(185,103,255,.28);border-left:2px solid var(--purple);border-radius:4px 8px 8px 4px;padding:9px 13px}
   .think .lbl{font-family:var(--mono);color:var(--purple);font-size:10px;text-transform:uppercase;letter-spacing:.16em;display:block;margin-bottom:4px}
@@ -167,6 +187,15 @@ const indexHTML = `<!doctype html>
   .kv span{flex:none}
   .kv b{color:var(--fg);font-weight:400;text-align:right;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .kv b:only-child{color:var(--accent)}
+  .rail h2 .svcref{float:right;background:none;border:1px solid var(--line);color:var(--muted);border-radius:5px;padding:0 7px;font-size:12px;line-height:1.4;cursor:pointer}
+  .rail h2 .svcref:hover{border-color:var(--accent);color:var(--accent)}
+  ul.svcs{list-style:none;margin:0;padding:0}
+  ul.svcs li{padding:7px 0;border-bottom:1px solid rgba(38,49,92,.5)} ul.svcs li:last-child{border-bottom:0}
+  .svc-top{display:flex;align-items:center;gap:7px}
+  .svc-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none} .svc-dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .svc-name{font-family:var(--mono);font-size:12.5px;color:var(--fg);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .svcstop{padding:2px 9px;font-size:10.5px} .svcstop:hover{border-color:var(--err);color:var(--err)}
+  .svc-sub{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:3px;padding-left:14px}
   .modal{position:fixed;inset:0;background:rgba(2,3,10,.75);display:none;align-items:center;justify-content:center;padding:30px;z-index:20;backdrop-filter:blur(3px)}
   .modal.show{display:flex}
   .modal .box{background:var(--panel);border:1px solid rgba(5,217,232,.4);border-radius:8px;max-width:900px;width:100%;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 0 40px rgba(5,217,232,.2),0 0 80px rgba(255,42,109,.1)}
@@ -246,10 +275,14 @@ const indexHTML = `<!doctype html>
   <aside class="rail" id="rail">
     <h2>Run</h2>
     <div id="railStatus"><div class="note">No active run.</div></div>
+    <h2>Usage</h2>
+    <div id="railUsage"><div class="note">No usage yet.</div></div>
     <h2>Plan</h2>
     <div id="railPlan"><div class="note">No plan yet.</div></div>
     <h2>Produced files</h2>
     <div id="railFiles"><div class="note">Files appear when a run ends.</div></div>
+    <h2>Services <button class="mini svcref" id="svcRefresh" title="Refresh services">↻</button></h2>
+    <div id="railServices"><div class="note">No background services.</div></div>
   </aside>
 </div>
 
@@ -278,6 +311,7 @@ const indexHTML = `<!doctype html>
       <div class="cfg-field"><label>Embed base URL</label><input id="embBase" placeholder="https://host/v1  (blank = same as chat)"></div>
       <div class="cfg-field"><label>Embed API key</label><input id="embKey" type="password" placeholder="blank = keep current"><div class="cfg-hint" id="embHint"></div></div>
       <div class="cfg-field"><label>Embed model</label><input id="embModel" placeholder="e.g. embedding-3 / text-embedding-3-small"></div>
+      <div style="display:flex;align-items:center;gap:10px"><button class="mini" id="embTest" type="button">Test connection</button><span class="cfg-hint" id="embTestMsg" style="margin:0"></span></div>
     </div>
     <div class="cfg-field" style="margin-top:16px">
       <label><input type="checkbox" id="cfgVision" style="width:auto;margin-right:8px;vertical-align:middle"> Send attached images to the model (vision)</label>
@@ -295,6 +329,47 @@ var thread=$('thread'), sessionsEl=$('sessions'), dotEl=$('dot');
 function esc(s){if(s==null)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function clr(el){while(el.firstChild)el.removeChild(el.firstChild)}
 function scroll(){thread.scrollTop=thread.scrollHeight}
+
+/* ---------- lightweight, safe markdown (input escaped first) ---------- */
+var BT=String.fromCharCode(96), FENCE=BT+BT+BT;
+function mdInline(s){
+  var code=new RegExp(BT+'([^'+BT+']+)'+BT,'g');
+  s=s.replace(code,function(_,c){return '<code>'+c+'</code>'});
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  s=s.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s;
+}
+function codeBlockHTML(escCode){
+  return '<div class="codeblock"><button class="copy" type="button" onclick="copyCode(this)">copy</button><pre><code>'+escCode+'</code></pre></div>';
+}
+function copyCode(btn){
+  var code=btn.parentNode.querySelector('code'); var txt=(code&&code.textContent)||'';
+  if(navigator.clipboard) navigator.clipboard.writeText(txt);
+  var old=btn.textContent; btn.textContent='copied'; setTimeout(function(){btn.textContent=old},1200);
+}
+function renderMarkdown(text){
+  var lines=esc(text==null?'':String(text)).split('\n'), out=[], i=0;
+  function isBlock(l){ return l.trim().slice(0,3)===FENCE||/^(#{1,6})\s+/.test(l)||/^\s*[-*]\s+/.test(l)||/^\s*\d+\.\s+/.test(l)||/^\s*>\s?/.test(l); }
+  while(i<lines.length){
+    var line=lines[i];
+    if(line.trim().slice(0,3)===FENCE){
+      var buf=[]; i++;
+      while(i<lines.length&&lines[i].trim().slice(0,3)!==FENCE){ buf.push(lines[i]); i++; }
+      i++; out.push(codeBlockHTML(buf.join('\n'))); continue;
+    }
+    var hm=/^(#{1,6})\s+(.*)$/.exec(line);
+    if(hm){ var lv=hm[1].length; out.push('<h'+lv+' class="mh'+lv+'">'+mdInline(hm[2])+'</h'+lv+'>'); i++; continue; }
+    if(/^\s*[-*]\s+/.test(line)){ var it=[]; while(i<lines.length&&/^\s*[-*]\s+/.test(lines[i])){ it.push('<li>'+mdInline(lines[i].replace(/^\s*[-*]\s+/,''))+'</li>'); i++; } out.push('<ul>'+it.join('')+'</ul>'); continue; }
+    if(/^\s*\d+\.\s+/.test(line)){ var ot=[]; while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){ ot.push('<li>'+mdInline(lines[i].replace(/^\s*\d+\.\s+/,''))+'</li>'); i++; } out.push('<ol>'+ot.join('')+'</ol>'); continue; }
+    if(/^\s*>\s?/.test(line)){ var q=[]; while(i<lines.length&&/^\s*>\s?/.test(lines[i])){ q.push(mdInline(lines[i].replace(/^\s*>\s?/,''))); i++; } out.push('<blockquote>'+q.join('<br>')+'</blockquote>'); continue; }
+    if(line.trim()===''){ i++; continue; }
+    var para=[]; while(i<lines.length&&lines[i].trim()!==''&&!isBlock(lines[i])){ para.push(lines[i]); i++; }
+    out.push('<p>'+mdInline(para.join('\n')).replace(/\n/g,'<br>')+'</p>');
+  }
+  return out.join('');
+}
+function fmtMs(ms){ ms=ms||0; if(ms<1000)return ms+' ms'; var s=ms/1000; return s<60?s.toFixed(1)+' s':Math.floor(s/60)+'m '+Math.round(s%60)+'s'; }
 
 /* ---------- sessions sidebar ---------- */
 function dotClass(status){
@@ -369,7 +444,7 @@ function addThink(ev){
   turn().appendChild(d); scroll();
 }
 function addMessage(ev){
-  var m=document.createElement('div'); m.className='msg'; m.textContent=ev.text||'';
+  var m=document.createElement('div'); m.className='msg md'; m.innerHTML=renderMarkdown(ev.text||'');
   turn().appendChild(m); scroll();
 }
 
@@ -381,14 +456,38 @@ function makeThinkEl(){
   turn().appendChild(d); return d.querySelector('pre');
 }
 function makeMsgEl(){
-  var m=document.createElement('div'); m.className='msg';
+  var m=document.createElement('div'); m.className='msg md';
   turn().appendChild(m); return m;
 }
 function addDelta(ev){
   var key=(ev.step||0)+':'+(ev.kind||'message');
   var el=deltaEls[key];
-  if(!el){ el=(ev.kind==='think')?makeThinkEl():makeMsgEl(); deltaEls[key]=el; }
-  el.textContent+=(ev.text||''); scroll();
+  if(ev.kind==='think'){
+    if(!el){ el=makeThinkEl(); deltaEls[key]=el; }
+    el.textContent+=(ev.text||'');
+  }else{
+    if(!el){ el=makeMsgEl(); el._raw=''; deltaEls[key]=el; }
+    el._raw+=(ev.text||''); el.innerHTML=renderMarkdown(el._raw);
+  }
+  scroll();
+}
+
+/* live stdout streamed from run_shell/run_python before the final tool card */
+var liveOuts={};
+function addStdout(ev){
+  var el=liveOuts[ev.step];
+  if(!el){
+    var card=document.createElement('details'); card.className='tool live'; card.open=true;
+    var kind=KIND[ev.tool]||ev.tool;
+    card.innerHTML='<summary><span class="kind">'+esc(kind)+'</span><span class="cmd">running…</span><span class="n">#'+(ev.step||'')+'</span></summary><pre class="liveout"></pre>';
+    turn().appendChild(card);
+    el=card.querySelector('.liveout'); el._card=card; liveOuts[ev.step]=el;
+  }
+  el.textContent+=(ev.text||''); el.scrollTop=el.scrollHeight; scroll();
+}
+function clearLive(step){
+  var el=liveOuts[step]; if(el&&el._card&&el._card.parentNode) el._card.parentNode.removeChild(el._card);
+  delete liveOuts[step];
 }
 function addNote(ev,cls){
   var n=document.createElement('div'); n.className='note'+(cls?' '+cls:''); n.textContent=ev.text||'';
@@ -454,6 +553,39 @@ function renderRailStatus(o){
     +(o.episode?'<div class="kv"><span>episode</span><b title="'+escA(o.episode)+'">'+esc(o.episode)+'</b></div>':'');
 }
 
+function renderUsage(o){
+  var el=$('railUsage');
+  if(!o||(!o.total_tokens&&!o.prompt_tokens&&!o.completion_tokens&&!o.elapsed_ms)){ el.innerHTML='<div class="note">No usage yet.</div>'; return; }
+  el.innerHTML='<div class="kv"><span>tokens</span><b>'+(o.total_tokens||0)+'</b></div>'
+    +'<div class="kv"><span>prompt</span><b>'+(o.prompt_tokens||0)+'</b></div>'
+    +'<div class="kv"><span>completion</span><b>'+(o.completion_tokens||0)+'</b></div>'
+    +'<div class="kv"><span>llm calls</span><b>'+(o.llm_calls||0)+'</b></div>'
+    +'<div class="kv"><span>elapsed</span><b>'+fmtMs(o.elapsed_ms)+'</b></div>';
+}
+/* ---------- background services panel ---------- */
+function loadServices(session){
+  session=session||currentSession;
+  if(!session){ $('railServices').innerHTML='<div class="note">No background services.</div>'; return; }
+  fetch('/services?session='+encodeURIComponent(session)).then(function(r){return r.json()})
+    .then(function(d){ renderServices(session,(d&&d.services)||[]); }).catch(function(){});
+}
+function renderServices(session,svcs){
+  var el=$('railServices');
+  if(!svcs||!svcs.length){ el.innerHTML='<div class="note">No background services.</div>'; return; }
+  var h='<ul class="svcs">';
+  svcs.forEach(function(s){
+    var nm=escA(s.name);
+    h+='<li><div class="svc-top"><span class="svc-dot '+(s.alive?'on':'')+'"></span><span class="svc-name" title="'+escA(s.cmd||s.name)+'">'+esc(s.name)+'</span>';
+    if(s.alive) h+='<button class="mini svcstop" type="button" onclick="stopService(\''+escA(session)+'\',\''+nm+'\')">Stop</button>';
+    h+='</div><div class="svc-sub">'+(s.port?('port '+s.port+' · '):'')+'pid '+(s.pid||0)+' · '+(s.alive?'alive':'exited')+'</div></li>';
+  });
+  el.innerHTML=h+'</ul>';
+}
+function stopService(session,name){
+  fetch('/services?session='+encodeURIComponent(session)+'&name='+encodeURIComponent(name),{method:'POST'})
+    .then(function(r){return r.json()}).then(function(d){ renderServices(session,(d&&d.services)||[]); }).catch(function(){});
+}
+
 /* ---------- file modal ---------- */
 function viewFile(run,name){
   fetch('/file?run='+encodeURIComponent(run)+'&name='+encodeURIComponent(name)).then(function(r){return r.text()}).then(function(t){
@@ -468,11 +600,12 @@ function emptyHTML(){ return '<div class="empty" id="emptyState"><h3>Start a con
   +'The session stays open — keep chatting to build on what it did.</div></div>'; }
 function newRun(){
   if(running) return;
-  stopRun(); currentSession=null; curTurn=null; deltaEls={};
+  stopRun(); currentSession=null; curTurn=null; deltaEls={}; liveOuts={};
   pendingAtts=[]; renderChips();
   thread.innerHTML=emptyHTML();
   $('chatTitle').textContent='New session'; setBadge('');
-  renderPlan(null); renderFiles(null); $('railStatus').innerHTML='<div class="note">No active run.</div>';
+  renderPlan(null); renderFiles(null); renderUsage(null); renderServices(null,[]);
+  $('railStatus').innerHTML='<div class="note">No active run.</div>';
   $('task').value=''; $('task').focus(); loadSessions(null);
 }
 function setRunning(on){
@@ -486,7 +619,7 @@ function sendTask(task){
   var es0=$('emptyState'); if(es0) es0.remove();
   var atts=pendingAtts.slice(); pendingAtts=[]; renderChips();
   addUser(task,atts);
-  curTurn=newAssistTurn(); deltaEls={};
+  curTurn=newAssistTurn(); deltaEls={}; liveOuts={};
   setRunning(true); setBadge('running','run');
   if(!currentSession){ $('chatTitle').textContent=task; renderRailStatus({status:'running',steps:0}); }
   var pk=splitPick($('modelSel').value||'');
@@ -507,15 +640,19 @@ function sendTask(task){
         loadSessions(currentSession);
         break;
       case 'delta': addDelta(ev); break;
+      case 'stdout': addStdout(ev); break;
+      case 'usage': renderUsage(ev); break;
       case 'think': addThink(ev); break;
       case 'message': addMessage(ev); break;
       case 'title':
         if(ev.text){ $('chatTitle').textContent=ev.text; loadSessions(currentSession); }
         break;
       case 'step':
+        clearLive(ev.step);
         if(ev.tool==='update_plan'||ev.tool==='set_title')break;
         addToolCard(ev.step,ev.tool,ev.args,ev.output,ev.is_error);
         renderRailStatus({status:'running',steps:ev.step,episode:currentSession});
+        if(ev.tool==='start_service'||ev.tool==='stop_service') loadServices(currentSession);
         break;
       case 'plan': renderPlan(ev.plan); break;
       case 'file': addFileMsg(ev); break;
@@ -529,7 +666,9 @@ function sendTask(task){
         setBadge(ev.reply?'answered':(ev.success?(ev.verified?'verified':'success'):(ev.stop_reason||'stopped')),
                  ev.reply?'':(ev.success?'ok':'err'));
         renderRailStatus({status:ev.stop_reason||'done',steps:ev.steps,verified:ev.reply?null:ev.verified,episode:ev.session||currentSession});
+        /* usage is kept live via 'usage' events (which include the post-run title call); avoid downgrading it here */
         renderFiles(ev.run,ev.files);
+        loadServices(ev.session||currentSession);
         loadSessions(ev.session||currentSession);
         break;
       case 'done': stopRun(); break;
@@ -541,10 +680,10 @@ function sendTask(task){
 /* ---------- open a session (replay history; keep chatting to continue) ---------- */
 function openEpisode(id){
   if(running) return;
-  stopRun(); currentSession=id; curTurn=null; deltaEls={};
+  stopRun(); currentSession=id; curTurn=null; deltaEls={}; liveOuts={};
   pendingAtts=[]; renderChips();
   clr(thread);
-  loadSessions(id);
+  loadSessions(id); loadServices(id); renderUsage(null);
   fetch('/episode?id='+encodeURIComponent(id)).then(function(r){return r.json()}).then(function(d){
     var ep=d.episode||{}; var events=d.events||[];
     $('chatTitle').textContent=ep.title||ep.task||id;
@@ -695,9 +834,17 @@ $('cfgSources').addEventListener('click',function(e){
   }
 });
 $('cfgAdd').addEventListener('click',function(){ $('cfgSources').insertAdjacentHTML('beforeend', srcCardHTML(null)); });
+$('embTest').addEventListener('click',function(){
+  var m=$('embTestMsg'); m.style.color='var(--muted)'; m.textContent='Save first if you changed anything. Testing…';
+  fetch('/embed/test').then(function(r){return r.json()}).then(function(d){
+    if(d.ok){ m.style.color='var(--ok)'; m.textContent='OK — '+(d.model||'')+' ('+d.dims+' dims)'; }
+    else { m.style.color='var(--err)'; m.textContent='Failed: '+(d.error||'unknown'); }
+  }).catch(function(e){ m.style.color='var(--err)'; m.textContent='Failed: '+e; });
+});
 $('cfgBtn').addEventListener('click',openCfg);
 $('cfgClose').addEventListener('click',closeCfg);
 $('cfgSave').addEventListener('click',saveCfg);
+$('svcRefresh').addEventListener('click',function(){ loadServices(currentSession); });
 
 /* ---------- attachments ---------- */
 var pendingAtts=[];

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUpdatePlanAcceptsArrayAndString(t *testing.T) {
@@ -122,6 +123,44 @@ func TestGlobAndGrepTools(t *testing.T) {
 	}
 	if strings.Contains(gr.Output, "node_modules") {
 		t.Fatalf("grep should skip node_modules: %s", gr.Output)
+	}
+}
+
+func TestFileJail(t *testing.T) {
+	dir := t.TempDir()
+	b := &Builtins{Workdir: dir}
+	// Reading a path that escapes the workspace must be blocked.
+	esc := (&readFileTool{b}).Execute(context.Background(), map[string]any{"path": "../../../etc/hosts"})
+	if !esc.IsError || !strings.Contains(esc.Output, "outside the workspace") {
+		t.Fatalf("expected jail to block escape, got %+v", esc)
+	}
+	// Absolute path outside the workspace must be blocked too.
+	absEsc := (&readFileTool{b}).Execute(context.Background(), map[string]any{"path": "/etc/hosts"})
+	if !absEsc.IsError {
+		t.Fatalf("expected jail to block absolute escape, got %+v", absEsc)
+	}
+	// A normal in-workspace write/read round-trips.
+	if w := (&writeFileTool{b}).Execute(context.Background(), map[string]any{"path": "note.txt", "content": "hi"}); w.IsError {
+		t.Fatalf("in-jail write failed: %+v", w)
+	}
+	if r := (&readFileTool{b}).Execute(context.Background(), map[string]any{"path": "note.txt"}); r.IsError || r.Output != "hi" {
+		t.Fatalf("in-jail read failed: %+v", r)
+	}
+}
+
+func TestRunShellStreamsToSink(t *testing.T) {
+	b := &Builtins{Workdir: t.TempDir(), Timeout: 10 * time.Second}
+	var got strings.Builder
+	ctx := WithOutputSink(context.Background(), func(chunk string) { got.WriteString(chunk) })
+	res := (&shellTool{b}).Execute(ctx, map[string]any{"command": "printf 'line1\\nline2\\n'"})
+	if res.IsError {
+		t.Fatalf("shell failed: %+v", res)
+	}
+	if !strings.Contains(got.String(), "line1") || !strings.Contains(got.String(), "line2") {
+		t.Fatalf("sink did not receive streamed output: %q", got.String())
+	}
+	if !strings.Contains(res.Output, "line1") {
+		t.Fatalf("final output missing content: %q", res.Output)
 	}
 }
 

@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,17 +74,82 @@ func resolvePython() string {
 	return "python3"
 }
 
+// outputSink receives incremental stdout/stderr chunks from a streaming command
+// so callers (the agent → web UI) can show long-running output as it is
+// produced instead of only at the end.
+type outputSink func(chunk string)
+
+type sinkKey struct{}
+
+// WithOutputSink attaches a streaming-output callback to ctx; run_shell and
+// run_python invoke it with each output chunk as it arrives.
+func WithOutputSink(ctx context.Context, fn outputSink) context.Context {
+	return context.WithValue(ctx, sinkKey{}, fn)
+}
+
+func sinkFrom(ctx context.Context) outputSink {
+	if fn, ok := ctx.Value(sinkKey{}).(outputSink); ok {
+		return fn
+	}
+	return nil
+}
+
 // runCmd executes a command in Workdir with a timeout, returning combined
-// stdout+stderr and whether it failed.
+// stdout+stderr and whether it failed. If a streaming sink is attached to ctx,
+// output is forwarded chunk-by-chunk as it is produced.
 func (b *Builtins) runCmd(ctx context.Context, name string, args ...string) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, b.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, name, args...)
 	cmd.Dir = b.Workdir
-	out, err := cmd.CombinedOutput()
-	s := clip(string(out))
-	if cctx.Err() == context.DeadlineExceeded {
-		return s + fmt.Sprintf("\n[timed out after %s]", b.Timeout), true
+
+	sink := sinkFrom(ctx)
+	if sink == nil {
+		// Fast path: no live streaming requested.
+		out, err := cmd.CombinedOutput()
+		return finishCmdOutput(cctx, string(out), err, b.Timeout)
+	}
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return "cannot start command: " + err.Error(), true
+	}
+	var buf strings.Builder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reader := bufio.NewReader(pr)
+		const streamCap = 64 * 1024 // bound how much we forward to the UI
+		streamed := 0
+		for {
+			line, err := reader.ReadString('\n')
+			if len(line) > 0 {
+				buf.WriteString(line)
+				if streamed < streamCap {
+					sink(line)
+					streamed += len(line)
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	werr := cmd.Wait()
+	pw.Close()
+	<-done
+	return finishCmdOutput(cctx, buf.String(), werr, b.Timeout)
+}
+
+// finishCmdOutput applies the shared clip / timeout / exit-status formatting to
+// a command's combined output.
+func finishCmdOutput(ctx context.Context, raw string, err error, timeout time.Duration) (string, bool) {
+	s := clip(raw)
+	if ctx.Err() == context.DeadlineExceeded {
+		return s + fmt.Sprintf("\n[timed out after %s]", timeout), true
 	}
 	if err != nil {
 		return fmt.Sprintf("%s\n[exit: %v]", s, err), true
@@ -109,6 +175,19 @@ func (b *Builtins) resolve(p string) string {
 		return p
 	}
 	return filepath.Join(b.Workdir, p)
+}
+
+// resolveJailed is like resolve but refuses paths that escape the workspace
+// (via absolute paths or ".." traversal). File tools use it so the agent cannot
+// read or clobber files outside its sandboxed working directory. Shell/python
+// are intentionally NOT jailed (only the dangerous-command guard applies there).
+func (b *Builtins) resolveJailed(p string) (string, error) {
+	full := filepath.Clean(b.resolve(p))
+	root := filepath.Clean(b.Workdir)
+	if full == root || strings.HasPrefix(full, root+string(os.PathSeparator)) {
+		return full, nil
+	}
+	return "", fmt.Errorf("path %q is outside the workspace and is blocked", p)
 }
 
 func str(args map[string]any, key string) string {
@@ -283,7 +362,11 @@ func (t *readFileTool) Spec() domain.ActionSchema {
 }
 
 func (t *readFileTool) Execute(_ context.Context, args map[string]any) Result {
-	data, err := os.ReadFile(t.b.resolve(str(args, "path")))
+	p, err := t.b.resolveJailed(str(args, "path"))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
+	data, err := os.ReadFile(p)
 	if err != nil {
 		return Result{IsError: true, Output: "read failed: " + err.Error()}
 	}
@@ -304,7 +387,10 @@ func (t *writeFileTool) Spec() domain.ActionSchema {
 }
 
 func (t *writeFileTool) Execute(_ context.Context, args map[string]any) Result {
-	p := t.b.resolve(str(args, "path"))
+	p, err := t.b.resolveJailed(str(args, "path"))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return Result{IsError: true, Output: "mkdir failed: " + err.Error()}
 	}
@@ -337,7 +423,10 @@ func (t *editFileTool) Spec() domain.ActionSchema {
 }
 
 func (t *editFileTool) Execute(_ context.Context, args map[string]any) Result {
-	p := t.b.resolve(str(args, "path"))
+	p, err := t.b.resolveJailed(str(args, "path"))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
 	oldS := str(args, "old_string")
 	newS := str(args, "new_string")
 	replaceAll, _ := args["replace_all"].(bool)
@@ -390,7 +479,10 @@ func (t *listDirTool) Spec() domain.ActionSchema {
 }
 
 func (t *listDirTool) Execute(_ context.Context, args map[string]any) Result {
-	root := t.b.resolve(strOr(args, "path", "."))
+	root, err := t.b.resolveJailed(strOr(args, "path", "."))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
 	depth := intArg(args, "depth", 1)
 	if depth < 1 {
 		depth = 1
@@ -481,7 +573,10 @@ func (t *globTool) Execute(_ context.Context, args map[string]any) Result {
 	if err != nil {
 		return Result{IsError: true, Output: "bad pattern: " + err.Error()}
 	}
-	root := t.b.resolve(strOr(args, "path", "."))
+	root, err := t.b.resolveJailed(strOr(args, "path", "."))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
 	baseOnly := !strings.Contains(pattern, "/")
 
 	const maxMatches = 300
@@ -557,7 +652,10 @@ func (t *grepTool) Execute(_ context.Context, args map[string]any) Result {
 			return Result{IsError: true, Output: "bad include glob: " + err.Error()}
 		}
 	}
-	root := t.b.resolve(strOr(args, "path", "."))
+	root, err := t.b.resolveJailed(strOr(args, "path", "."))
+	if err != nil {
+		return Result{IsError: true, Output: err.Error()}
+	}
 	includeBaseOnly := incRe != nil && !strings.Contains(str(args, "include"), "/")
 
 	const (

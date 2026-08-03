@@ -71,7 +71,7 @@ func (r *Retrying) Generate(ctx context.Context, req domain.LLMRequest) (domain.
 			return resp, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !retryable(err) {
 			break
 		}
 	}
@@ -104,7 +104,7 @@ func (r *Retrying) GenerateStream(ctx context.Context, req domain.LLMRequest, on
 			return resp, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil || emitted {
+		if ctx.Err() != nil || emitted || !retryable(err) {
 			break
 		}
 	}

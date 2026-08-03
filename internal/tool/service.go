@@ -2,11 +2,13 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,6 +16,101 @@ import (
 
 	"liveagent/internal/domain"
 )
+
+// serviceMetaDir is the per-workspace directory holding one JSON descriptor per
+// background service. Persisting pid/meta to disk lets the web UI list and stop
+// services even after a server restart, when the in-memory registry is gone.
+const serviceMetaDir = ".services"
+
+// ServiceInfo is a persisted background-service descriptor (also returned to the
+// web UI). Alive is computed at read time from the pid, not stored.
+type ServiceInfo struct {
+	Name      string `json:"name"`
+	Cmd       string `json:"cmd"`
+	Port      int    `json:"port,omitempty"`
+	PID       int    `json:"pid"`
+	Log       string `json:"log"`
+	StartedAt string `json:"started_at"`
+	Alive     bool   `json:"alive"`
+}
+
+func metaPath(workdir, name string) string {
+	return filepath.Join(workdir, serviceMetaDir, name+".json")
+}
+
+// writeServiceMeta persists a service descriptor so it can be recovered later.
+func writeServiceMeta(workdir string, info ServiceInfo) {
+	info.Alive = false // never persist the transient flag
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(metaPath(workdir, info.Name), data, 0o644)
+}
+
+func removeServiceMeta(workdir, name string) { _ = os.Remove(metaPath(workdir, name)) }
+
+// ListServices reads all persisted service descriptors for a workspace and
+// annotates each with whether its process is still alive. It is used by the web
+// UI's services panel and is independent of any live tool registry.
+func ListServices(workdir string) []ServiceInfo {
+	dir := filepath.Join(workdir, serviceMetaDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []ServiceInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var info ServiceInfo
+		if json.Unmarshal(data, &info) != nil || info.Name == "" {
+			continue
+		}
+		info.Alive = alive(info.PID)
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// StopService terminates a persisted service (whole process group) by name and
+// removes its descriptor. Safe to call for an already-dead service.
+func StopService(workdir, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("name is empty")
+	}
+	data, err := os.ReadFile(metaPath(workdir, name))
+	if err != nil {
+		return "", fmt.Errorf("no such service: %s", name)
+	}
+	var info ServiceInfo
+	if json.Unmarshal(data, &info) != nil {
+		removeServiceMeta(workdir, name)
+		return "", fmt.Errorf("corrupt service descriptor: %s", name)
+	}
+	pid := info.PID
+	if pid <= 0 || !alive(pid) {
+		removeServiceMeta(workdir, name)
+		return fmt.Sprintf("service %q was not running; removed.", name), nil
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	for i := 0; i < 15 && alive(pid); i++ {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if alive(pid) {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		time.Sleep(150 * time.Millisecond)
+	}
+	removeServiceMeta(workdir, name)
+	return fmt.Sprintf("stopped service %q (pid %d).", name, pid), nil
+}
 
 // bgService is a long-running process (e.g. an HTTP server) started detached so
 // the agent's turn does NOT block on it. Output is redirected to a log file the
@@ -137,6 +234,10 @@ func (t *startServiceTool) Execute(_ context.Context, args map[string]any) Resul
 
 	name = t.b.registerService(svc)
 	pid := cmd.Process.Pid
+	writeServiceMeta(t.b.Workdir, ServiceInfo{
+		Name: name, Cmd: command, Port: port, PID: pid, Log: logRel,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
 
 	// Give it a moment; if it died immediately (e.g. port in use), surface the log.
 	time.Sleep(600 * time.Millisecond)
@@ -242,6 +343,7 @@ func (t *stopServiceTool) Execute(_ context.Context, args map[string]any) Result
 		t.b.svcMu.Lock()
 		delete(t.b.services, name)
 		t.b.svcMu.Unlock()
+		removeServiceMeta(t.b.Workdir, name)
 		return Result{Output: fmt.Sprintf("service %q was not running; removed.", name)}
 	}
 	// Signal the whole group (negative pid). SIGTERM first, then SIGKILL.
@@ -256,6 +358,7 @@ func (t *stopServiceTool) Execute(_ context.Context, args map[string]any) Result
 	t.b.svcMu.Lock()
 	delete(t.b.services, name)
 	t.b.svcMu.Unlock()
+	removeServiceMeta(t.b.Workdir, name)
 	return Result{Output: fmt.Sprintf("stopped service %q (pid %d).", name, pid)}
 }
 

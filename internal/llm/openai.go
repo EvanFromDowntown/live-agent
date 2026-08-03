@@ -157,9 +157,13 @@ type chatResponse struct {
 			ToolCalls        []toolCallWire `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
-	Usage struct {
-		TotalTokens int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage usageWire `json:"usage"`
+}
+
+type usageWire struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // buildRequest assembles the wire request shared by Generate and GenerateStream.
@@ -242,7 +246,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return domain.LLMResponse{}, fmt.Errorf("llm: status %d: %s", resp.StatusCode, truncate(string(data), 300))
+		return domain.LLMResponse{}, &APIError{StatusCode: resp.StatusCode, Body: truncate(string(data), 300)}
 	}
 	var parsed chatResponse
 	if err := json.Unmarshal(data, &parsed); err != nil {
@@ -256,7 +260,12 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (d
 	if reasoning == "" {
 		reasoning = msg.Reasoning
 	}
-	out := domain.LLMResponse{Text: msg.Content, Reasoning: reasoning, TokensUsed: parsed.Usage.TotalTokens}
+	out := domain.LLMResponse{
+		Text: msg.Content, Reasoning: reasoning,
+		TokensUsed:       parsed.Usage.TotalTokens,
+		PromptTokens:     parsed.Usage.PromptTokens,
+		CompletionTokens: parsed.Usage.CompletionTokens,
+	}
 	for _, tc := range msg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, domain.ToolCall{
 			ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
@@ -282,9 +291,7 @@ type streamChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
-	Usage *struct {
-		TotalTokens int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage *usageWire `json:"usage"`
 }
 
 // GenerateStream implements domain.StreamingLLM using OpenAI SSE streaming.
@@ -301,7 +308,7 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMReque
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
-		return domain.LLMResponse{}, fmt.Errorf("llm: status %d: %s", resp.StatusCode, truncate(string(data), 300))
+		return domain.LLMResponse{}, &APIError{StatusCode: resp.StatusCode, Body: truncate(string(data), 300)}
 	}
 
 	var content, reasoning strings.Builder
@@ -311,7 +318,7 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMReque
 	}
 	tools := map[int]*accTool{}
 	var order []int
-	tokens := 0
+	tokens, promptTokens, completionTokens := 0, 0, 0
 
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	for {
@@ -327,8 +334,16 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMReque
 				if json.Unmarshal([]byte(payload), &chunk) != nil {
 					// tolerate partial/keepalive frames
 				} else {
-					if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-						tokens = chunk.Usage.TotalTokens
+					if chunk.Usage != nil {
+						if chunk.Usage.TotalTokens > 0 {
+							tokens = chunk.Usage.TotalTokens
+						}
+						if chunk.Usage.PromptTokens > 0 {
+							promptTokens = chunk.Usage.PromptTokens
+						}
+						if chunk.Usage.CompletionTokens > 0 {
+							completionTokens = chunk.Usage.CompletionTokens
+						}
 					}
 					for _, ch := range chunk.Choices {
 						d := ch.Delta
@@ -373,7 +388,10 @@ func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMReque
 		}
 	}
 
-	out := domain.LLMResponse{Text: content.String(), Reasoning: reasoning.String(), TokensUsed: tokens}
+	out := domain.LLMResponse{
+		Text: content.String(), Reasoning: reasoning.String(),
+		TokensUsed: tokens, PromptTokens: promptTokens, CompletionTokens: completionTokens,
+	}
 	sort.Ints(order)
 	for _, idx := range order {
 		at := tools[idx]

@@ -78,10 +78,12 @@ type LLMRequest struct {
 // LLMResponse is the model's reply. ToolCalls is populated when the model used
 // native function-calling.
 type LLMResponse struct {
-	Text       string     `json:"text"`
-	Reasoning  string     `json:"reasoning,omitempty"` // model's thinking, when the provider exposes it
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	TokensUsed int        `json:"tokens_used"`
+	Text             string     `json:"text"`
+	Reasoning        string     `json:"reasoning,omitempty"` // model's thinking, when the provider exposes it
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	TokensUsed       int        `json:"tokens_used"`       // total tokens (prompt + completion) for this call
+	PromptTokens     int        `json:"prompt_tokens"`     // input tokens, when the provider reports them
+	CompletionTokens int        `json:"completion_tokens"` // output tokens, when the provider reports them
 }
 
 // LLM is the frozen cognitive module. It is never fine-tuned; we only change

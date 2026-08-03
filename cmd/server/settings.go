@@ -219,6 +219,33 @@ func (s *srv) currentEmbedder() llm.Embedder {
 	return s.embedder
 }
 
+// handleEmbedTest exercises the currently configured embedder with a sample
+// string so the user gets immediate pass/fail feedback instead of a silent
+// fallback to lexical recall.
+func (s *srv) handleEmbedTest(w http.ResponseWriter, r *http.Request) {
+	emb := s.currentEmbedder()
+	if emb == nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "no embedding model configured — set base URL / key / model and Save first"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	vecs, err := emb.Embed(ctx, []string{"live-agent embedding connectivity test"})
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	dims := 0
+	if len(vecs) > 0 {
+		dims = len(vecs[0])
+	}
+	model := ""
+	if oe, ok := emb.(*llm.OpenAIEmbedder); ok {
+		model = oe.Model()
+	}
+	writeJSON(w, map[string]any{"ok": true, "dims": dims, "model": model})
+}
+
 // maskedSources copies sources with keys replaced by a has_key flag.
 func (s *srv) maskedSources() []map[string]any {
 	out := make([]map[string]any, 0, len(s.set.Sources))

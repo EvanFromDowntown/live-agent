@@ -86,8 +86,8 @@ type LLMResponse struct {
 	CompletionTokens int        `json:"completion_tokens"` // output tokens, when the provider reports them
 }
 
-// LLM is the frozen cognitive module. It is never fine-tuned; we only change
-// what we put into the prompt.
+// LLM is the cognitive module the agent reasons with; the framework only shapes
+// what goes into the prompt and how results feed back.
 type LLM interface {
 	Generate(ctx context.Context, request LLMRequest) (LLMResponse, error)
 }

@@ -41,10 +41,15 @@ type AgentConfig struct {
 type LLMConfig struct {
 	Provider    string        `yaml:"provider"`
 	Model       string        `yaml:"model"`
+	APIPath     string        `yaml:"api_path"` // request path override (default "/chat/completions")
 	Timeout     time.Duration `yaml:"timeout"`
 	MaxRetries  int           `yaml:"max_retries"`
 	Temperature float64       `yaml:"temperature"`
-	MaxTokens   int           `yaml:"max_tokens"`
+	// OmitTemperature drops the temperature field from requests entirely. Set it
+	// for models that only accept their default temperature (e.g. some reasoning
+	// models) and reject any explicit value with a 400.
+	OmitTemperature bool `yaml:"omit_temperature"`
+	MaxTokens       int  `yaml:"max_tokens"`
 	// DisableResponseFormat avoids response_format:json_object on gateways that
 	// corrupt the request; irrelevant while tool-calling is active.
 	DisableResponseFormat bool `yaml:"disable_response_format"`

@@ -21,6 +21,14 @@ type source struct {
 	BaseURL string   `json:"base_url"`
 	APIKey  string   `json:"api_key,omitempty"`
 	Models  []string `json:"models"`
+
+	// Per-endpoint knobs (all optional). They let different gateways/models be
+	// tuned without touching the others.
+	APIPath         string   `json:"api_path,omitempty"`         // request path (default /chat/completions)
+	OmitTemperature bool     `json:"omit_temperature,omitempty"` // don't send temperature (for models that only accept their default)
+	Temperature     *float64 `json:"temperature,omitempty"`      // pin temperature for this endpoint
+	MaxTokens       int      `json:"max_tokens,omitempty"`       // pin max_tokens for this endpoint
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"` // "", "low", "medium", "high"
 }
 
 // embedSettings configures the (independent) embedding endpoint used for
@@ -174,14 +182,20 @@ func (s *srv) buildLLM(sourceBase, model string) (domain.LLM, error) {
 	if strings.TrimSpace(sourceBase) == "" {
 		sourceBase = s.set.Source
 	}
-	var base, key string
+	conn := llm.ModelConn{}
 	if src := s.findSource(sourceBase); src != nil {
-		base, key = src.BaseURL, src.APIKey
+		conn.BaseURL, conn.APIKey = src.BaseURL, src.APIKey
+		conn.APIPath = src.APIPath
+		conn.OmitTemperature = src.OmitTemperature
+		conn.Temperature = src.Temperature
+		conn.MaxTokens = src.MaxTokens
+		conn.ReasoningEffort = src.ReasoningEffort
 	}
 	if strings.TrimSpace(model) == "" {
 		model = s.set.Model
 	}
-	return llm.NewModel(s.cfg.LLM, base, key, model)
+	conn.Model = model
+	return llm.NewModel(s.cfg.LLM, conn)
 }
 
 // buildEmbedder constructs an embedder from the current embedding settings, or
@@ -250,10 +264,16 @@ func (s *srv) handleEmbedTest(w http.ResponseWriter, r *http.Request) {
 func (s *srv) maskedSources() []map[string]any {
 	out := make([]map[string]any, 0, len(s.set.Sources))
 	for _, src := range s.set.Sources {
-		out = append(out, map[string]any{
+		m := map[string]any{
 			"name": src.Name, "base_url": src.BaseURL,
 			"models": src.Models, "has_key": src.APIKey != "",
-		})
+			"api_path": src.APIPath, "omit_temperature": src.OmitTemperature,
+			"max_tokens": src.MaxTokens, "reasoning_effort": src.ReasoningEffort,
+		}
+		if src.Temperature != nil {
+			m["temperature"] = *src.Temperature
+		}
+		out = append(out, m)
 	}
 	return out
 }
@@ -284,6 +304,8 @@ func (s *srv) handleSettings(w http.ResponseWriter, r *http.Request) {
 				if src.Name == "" {
 					src.Name = src.BaseURL
 				}
+				src.APIPath = strings.TrimSpace(src.APIPath)
+				src.ReasoningEffort = strings.TrimSpace(src.ReasoningEffort)
 				src.Models = cleanModels(src.Models)
 				if strings.TrimSpace(src.APIKey) == "" { // keep existing key when blank
 					if old := s.findSource(src.BaseURL); old != nil {

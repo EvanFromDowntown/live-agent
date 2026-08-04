@@ -9,30 +9,60 @@ import (
 	"liveagent/internal/domain"
 )
 
+// ModelConn holds a runtime endpoint selection plus per-endpoint knobs. Empty
+// fields fall back to the base config / env. The web UI builds one of these per
+// source so different gateways/models can be tuned independently.
+type ModelConn struct {
+	BaseURL         string
+	APIKey          string
+	Model           string
+	APIPath         string   // request path override
+	OmitTemperature bool     // drop temperature entirely
+	Temperature     *float64 // pin temperature (nil = use per-call value)
+	MaxTokens       int      // pin max_tokens (0 = use per-call value)
+	ReasoningEffort string   // per-endpoint reasoning effort override
+}
+
 // New builds a domain.LLM from configuration, wrapping it with retry/timeout.
 // Only the OpenAI-compatible provider is supported; it reads credentials from
 // environment variables (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL).
 func New(cfg config.LLMConfig) (domain.LLM, error) {
-	return NewModel(cfg, "", "", "")
+	return NewModel(cfg, ModelConn{})
 }
 
-// NewModel is like New but takes explicit connection overrides (base URL, API
-// key, model) — used by the web UI so a session can pick its model and endpoint
-// at runtime. Empty overrides fall back to config / env.
-func NewModel(cfg config.LLMConfig, baseURL, apiKey, model string) (domain.LLM, error) {
+// NewModel is like New but takes explicit connection overrides — used by the web
+// UI so a session can pick its endpoint, model, and per-endpoint knobs at
+// runtime. Empty overrides fall back to config / env.
+func NewModel(cfg config.LLMConfig, conn ModelConn) (domain.LLM, error) {
 	switch cfg.Provider {
 	case "openai", "":
+		model := conn.Model
 		if model == "" {
 			model = cfg.Model
 		}
+		apiPath := conn.APIPath
+		if apiPath == "" {
+			apiPath = cfg.APIPath
+		}
+		reasoning := conn.ReasoningEffort
+		if reasoning == "" {
+			reasoning = cfg.ReasoningEffort
+		}
+		// Endpoint temperature policy: an explicit per-source pin wins; otherwise
+		// fall back to the config-level omit flag.
+		omitTemp := cfg.OmitTemperature || conn.OmitTemperature
 		p, err := NewOpenAIProvider(OpenAIConfig{
-			BaseURL:               baseURL,
-			APIKey:                apiKey,
+			BaseURL:               conn.BaseURL,
+			APIKey:                conn.APIKey,
 			Model:                 model,
+			APIPath:               apiPath,
 			Timeout:               cfg.Timeout,
 			DisableResponseFormat: cfg.DisableResponseFormat,
 			DisableThinking:       cfg.DisableThinking,
-			ReasoningEffort:       cfg.ReasoningEffort,
+			ReasoningEffort:       reasoning,
+			OmitTemperature:       omitTemp,
+			Temperature:           conn.Temperature,
+			MaxTokens:             conn.MaxTokens,
 		})
 		if err != nil {
 			return nil, err

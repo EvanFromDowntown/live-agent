@@ -23,24 +23,33 @@ type OpenAIProvider struct {
 	baseURL               string
 	apiKey                string
 	model                 string
+	apiPath               string // request path, default "/chat/completions"
 	client                *http.Client
 	streamClient          *http.Client // no overall timeout; streaming is bounded by context
 	disableResponseFormat bool
 	disableThinking       bool
 	reasoningEffort       string
+	omitTemperature       bool     // never send "temperature" (some models only accept their default)
+	temperature           *float64 // force this temperature for every call (overrides the request's)
+	maxTokens             int      // force this max_tokens for every call (0 = use the request's)
 }
 
 // OpenAIConfig configures the provider. BaseURL / APIKey / Model may be given
 // explicitly (e.g. chosen in the UI); when empty they fall back to the env vars
-// LLM_BASE_URL / LLM_API_KEY / LLM_MODEL.
+// LLM_BASE_URL / LLM_API_KEY / LLM_MODEL. The remaining fields are per-endpoint
+// knobs so different gateways/models can be tuned independently.
 type OpenAIConfig struct {
 	BaseURL               string
 	APIKey                string
 	Model                 string
+	APIPath               string // override the request path (default "/chat/completions")
 	Timeout               time.Duration
 	DisableResponseFormat bool
 	DisableThinking       bool
 	ReasoningEffort       string
+	OmitTemperature       bool     // drop the temperature field entirely
+	Temperature           *float64 // pin temperature for this endpoint (nil = use per-call value)
+	MaxTokens             int      // pin max_tokens for this endpoint (0 = use per-call value)
 }
 
 // NewOpenAIProvider builds a provider, preferring explicit config values and
@@ -72,15 +81,26 @@ func NewOpenAIProvider(cfg OpenAIConfig) (*OpenAIProvider, error) {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
+	apiPath := strings.TrimSpace(cfg.APIPath)
+	if apiPath == "" {
+		apiPath = "/chat/completions"
+	}
+	if !strings.HasPrefix(apiPath, "/") {
+		apiPath = "/" + apiPath
+	}
 	return &OpenAIProvider{
 		baseURL:               base,
 		apiKey:                key,
 		model:                 model,
+		apiPath:               apiPath,
 		client:                &http.Client{Timeout: timeout},
 		streamClient:          &http.Client{}, // bounded by ctx, not a fixed deadline
 		disableResponseFormat: cfg.DisableResponseFormat,
 		disableThinking:       cfg.DisableThinking,
 		reasoningEffort:       cfg.ReasoningEffort,
+		omitTemperature:       cfg.OmitTemperature,
+		temperature:           cfg.Temperature,
+		maxTokens:             cfg.MaxTokens,
 	}, nil
 }
 
@@ -117,7 +137,7 @@ type chatRequest struct {
 	Messages        []chatMessage   `json:"messages"`
 	Tools           []toolDefWire   `json:"tools,omitempty"`
 	ToolChoice      string          `json:"tool_choice,omitempty"`
-	Temperature     float64         `json:"temperature"`
+	Temperature     *float64        `json:"temperature,omitempty"`
 	MaxTokens       int             `json:"max_tokens,omitempty"`
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
 	Thinking        *thinkingParam  `json:"thinking,omitempty"`
@@ -167,7 +187,9 @@ type usageWire struct {
 }
 
 // buildRequest assembles the wire request shared by Generate and GenerateStream.
-func (p *OpenAIProvider) buildRequest(req domain.LLMRequest, stream bool) chatRequest {
+// forceOmitTemp drops the temperature field regardless of config; it is used to
+// auto-recover from gateways that reject any explicit temperature for a model.
+func (p *OpenAIProvider) buildRequest(req domain.LLMRequest, stream, forceOmitTemp bool) chatRequest {
 	msgs := make([]chatMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		if len(m.Images) > 0 {
@@ -184,10 +206,22 @@ func (p *OpenAIProvider) buildRequest(req domain.LLMRequest, stream bool) chatRe
 		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
 	}
 	body := chatRequest{
-		Model:       p.model,
-		Messages:    msgs,
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
+		Model:     p.model,
+		Messages:  msgs,
+		MaxTokens: req.MaxTokens,
+	}
+	if p.maxTokens > 0 {
+		body.MaxTokens = p.maxTokens
+	}
+	// Temperature is optional: omit it entirely when configured to (or when
+	// forced by the auto-recovery path) so models that only accept their default
+	// value don't 400. Otherwise a per-endpoint pin overrides the per-call value.
+	if !p.omitTemperature && !forceOmitTemp {
+		t := req.Temperature
+		if p.temperature != nil {
+			t = *p.temperature
+		}
+		body.Temperature = &t
 	}
 	if len(req.Tools) > 0 {
 		body.Tools = make([]toolDefWire, 0, len(req.Tools))
@@ -224,7 +258,7 @@ func (p *OpenAIProvider) newHTTPRequest(ctx context.Context, body chatRequest) (
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(raw))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+p.apiPath, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -233,9 +267,19 @@ func (p *OpenAIProvider) newHTTPRequest(ctx context.Context, body chatRequest) (
 	return httpReq, nil
 }
 
-// Generate implements domain.LLM.
+// Generate implements domain.LLM. If the gateway rejects the request solely
+// because this model won't accept an explicit temperature, it retries once with
+// the field omitted so the caller doesn't have to know each model's quirks.
 func (p *OpenAIProvider) Generate(ctx context.Context, req domain.LLMRequest) (domain.LLMResponse, error) {
-	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, false))
+	resp, err := p.generateOnce(ctx, req, false)
+	if err != nil && !p.omitTemperature && isTemperatureError(err) {
+		return p.generateOnce(ctx, req, true)
+	}
+	return resp, err
+}
+
+func (p *OpenAIProvider) generateOnce(ctx context.Context, req domain.LLMRequest, forceOmitTemp bool) (domain.LLMResponse, error) {
+	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, false, forceOmitTemp))
 	if err != nil {
 		return domain.LLMResponse{}, err
 	}
@@ -294,9 +338,19 @@ type streamChunk struct {
 	Usage *usageWire `json:"usage"`
 }
 
-// GenerateStream implements domain.StreamingLLM using OpenAI SSE streaming.
+// GenerateStream implements domain.StreamingLLM using OpenAI SSE streaming. A
+// temperature rejection (a 400 before any token) is auto-recovered by retrying
+// once with the field omitted.
 func (p *OpenAIProvider) GenerateStream(ctx context.Context, req domain.LLMRequest, onDelta func(domain.StreamDelta)) (domain.LLMResponse, error) {
-	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, true))
+	resp, err := p.streamOnce(ctx, req, onDelta, false)
+	if err != nil && !p.omitTemperature && isTemperatureError(err) {
+		return p.streamOnce(ctx, req, onDelta, true)
+	}
+	return resp, err
+}
+
+func (p *OpenAIProvider) streamOnce(ctx context.Context, req domain.LLMRequest, onDelta func(domain.StreamDelta), forceOmitTemp bool) (domain.LLMResponse, error) {
+	httpReq, err := p.newHTTPRequest(ctx, p.buildRequest(req, true, forceOmitTemp))
 	if err != nil {
 		return domain.LLMResponse{}, err
 	}

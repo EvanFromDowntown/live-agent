@@ -223,6 +223,13 @@ const indexHTML = `<!doctype html>
   .src-card .src-title{font-family:var(--disp);font-size:13px;font-weight:600;letter-spacing:.03em;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--purple)}
   .src-card .cfg-field{margin-bottom:10px}
   .src-card .cfg-field textarea{min-height:64px}
+  .src-adv{margin-top:4px}
+  .src-adv>summary{cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;padding:4px 0;user-select:none}
+  .src-adv>summary:hover{color:var(--accent)}
+  .cfg-row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .cfg-check{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--muted);line-height:1.4;margin-top:4px;cursor:pointer}
+  .cfg-check input{margin-top:2px}
+  .src-card .cfg-field select{background:rgba(4,5,14,.7);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px 11px;font:inherit}
   .modal .box.cfg{max-width:600px}
   .modal .box .body{padding:16px;overflow:auto}
   .modal .mh .actions{margin-left:auto;display:flex;gap:8px}
@@ -751,6 +758,9 @@ $('fetchBtn').addEventListener('click',function(){
 /* ---------- multi-source settings ---------- */
 function srcCardHTML(s){
   s=s||{name:'',base_url:'',models:[],has_key:false};
+  var eff=s.reasoning_effort||'';
+  function effOpt(v,label){ return '<option value="'+v+'"'+(eff===v?' selected':'')+'>'+label+'</option>'; }
+  var tempVal=(s.temperature!==undefined&&s.temperature!==null)?String(s.temperature):'';
   return '<div class="src-card">'
     +'<div class="src-head"><span class="src-title">'+esc(s.name||s.base_url||'New source')+'</span>'
       +'<button class="mini src-fetch" type="button">Fetch models</button>'
@@ -759,6 +769,17 @@ function srcCardHTML(s){
     +'<div class="cfg-field"><label>Base URL (OpenAI-compatible)</label><input class="s-base" value="'+escA(s.base_url||'')+'" placeholder="https://host/v1"></div>'
     +'<div class="cfg-field"><label>API key</label><input class="s-key" type="password" placeholder="'+(s.has_key?'leave blank to keep current':'sk-...')+'"><div class="cfg-hint">'+(s.has_key?'A key is set; leave blank to keep it.':'No key set.')+'</div></div>'
     +'<div class="cfg-field"><label>Models (one per line)</label><textarea class="s-models">'+esc((s.models||[]).join('\n'))+'</textarea></div>'
+    +'<details class="src-adv"><summary>Advanced (per-endpoint)</summary>'
+      +'<div class="cfg-row2">'
+        +'<div class="cfg-field"><label>API path</label><input class="s-path" value="'+escA(s.api_path||'')+'" placeholder="/chat/completions"></div>'
+        +'<div class="cfg-field"><label>Max tokens</label><input class="s-maxtok" type="number" min="0" value="'+(s.max_tokens?String(s.max_tokens):'')+'" placeholder="model default"></div>'
+      +'</div>'
+      +'<div class="cfg-row2">'
+        +'<div class="cfg-field"><label>Temperature override</label><input class="s-temp" type="number" step="0.1" value="'+escA(tempVal)+'" placeholder="use per-call"></div>'
+        +'<div class="cfg-field"><label>Reasoning effort</label><select class="s-effort">'+effOpt('','default')+effOpt('low','low')+effOpt('medium','medium')+effOpt('high','high')+'</select></div>'
+      +'</div>'
+      +'<label class="cfg-check"><input type="checkbox" class="s-omittemp"'+(s.omit_temperature?' checked':'')+'> Omit temperature (for models that only accept their default, e.g. GPT-5 / o-series)</label>'
+    +'</details>'
     +'</div>';
 }
 function renderSources(sources){
@@ -768,12 +789,19 @@ function renderSources(sources){
 }
 function sourcesFromDOM(){
   return $$('#cfgSources .src-card').map(function(card){
-    return {
+    var o={
       name: card.querySelector('.s-name').value.trim(),
       base_url: card.querySelector('.s-base').value.trim(),
       api_key: card.querySelector('.s-key').value,
-      models: card.querySelector('.s-models').value.split('\n').map(function(x){return x.trim()}).filter(Boolean)
+      models: card.querySelector('.s-models').value.split('\n').map(function(x){return x.trim()}).filter(Boolean),
+      api_path: (card.querySelector('.s-path').value||'').trim(),
+      omit_temperature: card.querySelector('.s-omittemp').checked,
+      reasoning_effort: card.querySelector('.s-effort').value
     };
+    var mt=parseInt(card.querySelector('.s-maxtok').value,10); if(!isNaN(mt)&&mt>0) o.max_tokens=mt;
+    var tv=card.querySelector('.s-temp').value.trim();
+    if(tv!==''){ var t=parseFloat(tv); if(!isNaN(t)) o.temperature=t; }
+    return o;
   }).filter(function(s){return s.base_url});
 }
 function rebuildDefault(sources, model, source){
